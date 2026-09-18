@@ -97,8 +97,8 @@ export function validateBrowserAction(action: BrowserAction, state: PageState, o
   if (action.type === 'click' || action.type === 'type' || action.type === 'select') {
     const element = state.interactiveElements.find((candidate) => candidate.id === action.elementId)
     if (!element) return { ok: false, reason: 'The selected element is no longer present on the page.' }
-    if (action.type === 'type' && element.type !== 'input') return { ok: false, reason: 'Typing is only allowed in a visible input.' }
-    if (action.type === 'select' && element.type !== 'select') return { ok: false, reason: 'Selecting an option requires a visible select.' }
+    if (action.type === 'type' && element.type !== 'input') return { ok: false, reason: 'Typing is only allowed in a rendered input.' }
+    if (action.type === 'select' && element.type !== 'select') return { ok: false, reason: 'Selecting an option requires a rendered select.' }
     if (action.type === 'select' && element.options?.length && !element.options.some((option) => !option.disabled && (option.label === action.value || option.value === action.value))) {
       return { ok: false, reason: 'The requested option is not available in the observed select.' }
     }
@@ -147,6 +147,12 @@ async function assertCurrentActionFresh(page: Page, state: PageState, action: Br
   if (!result.ok) throw new Error(result.reason)
 }
 
+async function bringTargetIntoView(page: Page, action: BrowserAction) {
+  const targetId = targetIdFor(action)
+  if (!targetId) return
+  await page.locator(elementSelector(targetId)).first().scrollIntoViewIfNeeded({ timeout: 5000 })
+}
+
 /**
  * Executes only a previously validated BrowserAction. This is the single
  * module allowed to translate an action into Playwright calls.
@@ -154,6 +160,7 @@ async function assertCurrentActionFresh(page: Page, state: PageState, action: Br
 export async function executeBrowserAction(page: Page, state: PageState, action: BrowserAction, options: { actionPolicy?: ActionPolicy } = {}): Promise<string> {
   const validation = validateBrowserAction(action, state, options)
   if (!validation.ok) throw new Error(validation.reason)
+  await bringTargetIntoView(page, action)
   await assertCurrentActionFresh(page, state, action)
 
   if (action.type === 'click') {

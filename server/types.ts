@@ -37,6 +37,9 @@ export interface InteractiveElement {
   checked?: boolean
   selectedIndex?: number
   expanded?: string
+  inViewport?: boolean
+  pageX?: number
+  pageY?: number
   options?: InteractiveOption[]
 }
 
@@ -45,6 +48,9 @@ export interface PageState {
   title: string
   visibleText: string
   interactiveElements: InteractiveElement[]
+  scrollY?: number
+  pageHeight?: number
+  viewport?: { width: number; height: number }
   /** Internal execution guards; never sent to the model. */
   snapshotKey?: string
   elementGuards?: Record<string, string>

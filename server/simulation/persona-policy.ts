@@ -74,9 +74,11 @@ export function createPersonaRuntimeSignals(persona: Persona, random: PersonaRan
 }
 
 export function visibleTextLimit(scanDepth: ScanDepth) {
-  if (scanDepth === 'shallow') return 2200
-  if (scanDepth === 'deep') return 6000
-  return 4200
+  // The agent receives the complete readable text of the loaded page. Scan
+  // depth still controls which controls are ranked and how long the persona
+  // explores, but it must not hide content below the fold from the observer.
+  void scanDepth
+  return 24000
 }
 
 export function sampleWaitMilliseconds(profile: PersonaBehaviorProfile, random: PersonaRandom) {

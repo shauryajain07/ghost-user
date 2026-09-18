@@ -68,8 +68,8 @@ const pageLabel = (state: { url: string; title: string }) => {
 }
 
 function stateFingerprint(state: Awaited<ReturnType<typeof observePage>>) {
-  return state.url + '|' + state.title + '|' + state.visibleText.slice(0, 2400) + '|' + state.interactiveElements
-    .map((element) => [element.id, element.type, element.text, element.ariaLabel, element.placeholder, element.href].filter(Boolean).join(':'))
+  return state.url + '|' + state.title + '|' + state.scrollY + '|' + state.pageHeight + '|' + state.visibleText.slice(0, 2400) + '|' + state.interactiveElements
+    .map((element) => [element.id, element.type, element.text, element.ariaLabel, element.placeholder, element.href, element.inViewport, element.pageY].filter((value) => value !== undefined).join(':'))
     .join('|')
 }
 

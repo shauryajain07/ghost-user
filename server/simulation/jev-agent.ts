@@ -11,15 +11,15 @@ const targetProbabilityThreshold = 0.35
 const maxTargetChoices = 240
 const ACTION_CRITERIA = {
   click: {
-    what: 'Click a visible link, button, tab, result, topic, card, or other page control that advances the task.',
+    what: 'Click a rendered link, button, tab, result, topic, card, or other page control anywhere on the loaded page that advances the task. Off-screen targets will be scrolled into view before the click.',
     not_for: 'Typing text, selecting a native dropdown option, scrolling, or opening a named website.',
   },
   type: {
-    what: 'Type one of the verbatim value candidates from the task into a visible text field.',
+    what: 'Type one of the verbatim value candidates from the task into a rendered text field anywhere on the loaded page. Off-screen targets will be scrolled into view before typing.',
     not_for: 'Inventing account details, passwords, payment information, or text that is not in the task.',
   },
   select: {
-    what: 'Choose one of the verbatim value candidates from a visible select control.',
+    what: 'Choose one of the verbatim value candidates from a rendered select control anywhere on the loaded page. Off-screen targets will be scrolled into view before selecting.',
     not_for: 'Clicking a card or button that only looks like a selector.',
   },
   scroll_down: { what: 'Scroll down to reveal more content or controls.', not_for: 'Going to another page.' },
@@ -32,7 +32,7 @@ const ACTION_CRITERIA = {
   close_tab: { what: 'Close the current tab when the task explicitly requires it.', not_for: 'Going back.' },
   wait: { what: 'Wait briefly for content or a transition to settle.', not_for: 'Waiting instead of taking an obvious safe action.' },
   finish: { what: 'Stop because the requested task is visibly complete or the next action is a protected boundary.', not_for: 'Stopping just because the page is unfamiliar.' },
-  none: { what: 'No safe action is justified from the current page and task.', not_for: 'A reasonable visible action.' },
+  none: { what: 'No safe action is justified from the current page and task.', not_for: 'A reasonable available action.' },
 } as const
 
 type JevActionName = keyof typeof ACTION_CRITERIA
@@ -100,7 +100,8 @@ function clean(value: string | undefined) {
 }
 
 function elementLabel(element: InteractiveElement) {
-  return [element.type, element.text || element.ariaLabel || element.placeholder || 'unnamed control', element.href ? `→ ${element.href}` : '']
+  const location = element.inViewport === false ? '[off-screen on loaded page]' : '[in current viewport]'
+  return [element.type, element.text || element.ariaLabel || element.placeholder || 'unnamed control', element.href ? `→ ${element.href}` : '', location]
     .filter(Boolean)
     .join(' ')
     .slice(0, 180)
@@ -181,6 +182,11 @@ export function pageSnapshotForJev(input: JevAgentInput, values: string[]) {
       url: input.state.url.slice(0, 240),
       title: input.state.title.slice(0, 160),
       visible_text: input.state.visibleText.slice(0, visibleTextLimit(input.persona.behavior.scanDepth)),
+      page_geometry: {
+        scroll_y: input.state.scrollY || 0,
+        page_height: input.state.pageHeight || 0,
+        viewport: input.state.viewport,
+      },
     },
     elements,
     value_candidates: values,
@@ -205,20 +211,20 @@ function buildQuestions(
   targetCandidates(state, task, avoidTargetIds, persona).forEach((element) => {
     targetCriteria[element.id] = elementLabel(element)
   })
-  targetCriteria.none = 'No visible control is the correct target.'
+  targetCriteria.none = 'No available control is the correct target.'
 
   const questions: Record<string, Question> = {
     action: choice(
       {
         question: 'Which single safe browser action should the persona take next to make progress on `goal`?',
-        focus: `Use the current page, visible text, element labels, persona traits, behavior profile, recent_actions, runtime signals, and progress. ${behaviorSummary(persona)}. ${recoveryInstruction(persona, runtimeSignals)} Choose finish only when the goal is visibly complete or the next step would cross a protected boundary. Never invent a target or value. Action policy is ${actionPolicy}; protected actions may only be executed when policy is full.`,
+        focus: `Use the complete loaded-page text, all rendered element labels, page geometry, persona traits, behavior profile, recent_actions, runtime signals, and progress. ${behaviorSummary(persona)}. ${recoveryInstruction(persona, runtimeSignals)} Choose finish only when the requested outcome is present on the loaded page or the next action would cross a protected boundary. Never invent a target or value. Action policy is ${actionPolicy}; protected actions may only be executed when policy is full.`,
       },
       ACTION_CRITERIA,
     ),
     target: choice(
       {
-        question: 'Which visible element id is the target for the chosen click, type, or select action?',
-        focus: 'Choose only an id from `elements`; choose none when the selected action does not need a target or when no visible target is reliable.',
+        question: 'Which element id is the target for the chosen click, type, or select action?',
+        focus: 'Choose only an id from `elements`; off-screen elements are valid because the browser will scroll them into view. Choose none when the selected action does not need a target or when no rendered target is reliable.',
       },
       targetCriteria,
     ),
@@ -408,8 +414,8 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
       confidence: Math.min(actionConfidence, targetConfidence),
       goalComplete,
       destructive,
-      summary: 'Jev chose a target action but did not identify a reliable visible target.',
-      expectedOutcome: 'Reassess the page and choose a visible target or a different safe action.',
+      summary: 'Jev chose a target action but did not identify a reliable rendered target.',
+      expectedOutcome: 'Reassess the loaded page and choose a rendered target or a different safe action.',
       ...metadata,
     })
   }
@@ -424,7 +430,7 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
       confidence: Math.min(actionConfidence, targetConfidence),
       goalComplete,
       destructive,
-      summary: 'Jev did not have enough confidence in a visible input target to act autonomously.',
+      summary: 'Jev did not have enough confidence in a rendered input target to act autonomously.',
       expectedOutcome: 'Expose a clearer field or provide a more specific task.',
       ...metadata,
     })

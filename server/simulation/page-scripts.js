@@ -93,25 +93,29 @@ export function readPageSnapshot(selector) {
     if (element.isContentEditable) return normalize(element.textContent)
     return normalize(element.getAttribute('aria-valuenow'))
   }
-  function visible(element) {
+  function rendered(element) {
     if (element.closest('[aria-hidden="true"], [inert]')) return false
     const style = window.getComputedStyle(element)
     const rect = element.getBoundingClientRect()
     const browserVisible = typeof element.checkVisibility === 'function'
       ? element.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
       : true
-    const centerX = rect.x + rect.width / 2
-    const centerY = rect.y + rect.height / 2
     return browserVisible
       && style.display !== 'none'
       && style.visibility !== 'hidden'
       && style.opacity !== '0'
       && rect.width > 0
       && rect.height > 0
-      && centerX >= 0
-      && centerY >= 0
-      && centerX < window.innerWidth
-      && centerY < window.innerHeight
+  }
+  function layoutFor(element) {
+    const rect = element.getBoundingClientRect()
+    const centerX = rect.x + rect.width / 2
+    const centerY = rect.y + rect.height / 2
+    return {
+      inViewport: centerX >= 0 && centerY >= 0 && centerX < window.innerWidth && centerY < window.innerHeight,
+      pageX: Math.round(rect.left + window.scrollX),
+      pageY: Math.round(rect.top + window.scrollY),
+    }
   }
   function guardFor(element) {
     const select = element
@@ -137,10 +141,11 @@ export function readPageSnapshot(selector) {
   const interactiveElements = elements.flatMap((element) => {
     const id = stableId(element)
     if (element instanceof HTMLInputElement && ['file', 'hidden'].includes(element.type)) return []
-    if (!visible(element)) return []
+    if (!rendered(element)) return []
     if (element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true') return []
     const role = roleFor(element)
     const type = typeFor(element, role)
+    const layout = layoutFor(element)
     const options = element instanceof HTMLSelectElement
       ? Array.from(element.options).map((option) => ({
           label: normalize(option.label || option.textContent),
@@ -161,28 +166,36 @@ export function readPageSnapshot(selector) {
       checked,
       selectedIndex: element instanceof HTMLSelectElement ? element.selectedIndex : undefined,
       expanded: element.getAttribute('aria-expanded') || undefined,
+      inViewport: layout.inViewport,
+      pageX: layout.pageX,
+      pageY: layout.pageY,
       options,
       guard: guardFor(element),
     }]
   })
 
   const title = document.title
-  const visibleText = normalize(document.body?.innerText).slice(0, 8000)
+  const visibleText = normalize(document.body?.innerText).slice(0, 24000)
+  const pageHeight = Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0)
   const elementGuards = Object.fromEntries(interactiveElements.map((element) => [element.id, element.guard]))
   const publicElements = interactiveElements.map(({ guard: _guard, ...element }) => element)
   const snapshotKey = JSON.stringify({
     url: location.href,
     title,
     visibleText: visibleText.slice(0, 6000),
-    scrollY,
-    innerWidth,
-    innerHeight,
+    scrollY: window.scrollY,
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+    pageHeight,
     elements: publicElements.map((element) => [element.id, element.role, element.text, element.ariaLabel, element.value, element.href]),
   })
 
   return {
     title,
     visibleText,
+    scrollY: window.scrollY,
+    pageHeight,
+    viewport: { width: window.innerWidth, height: window.innerHeight },
     interactiveElements: publicElements,
     elementGuards,
     snapshotKey,
@@ -220,25 +233,19 @@ export function checkCurrentAction({ targetId, expectedGuard }) {
     if (candidate.isContentEditable) return normalize(candidate.textContent)
     return normalize(candidate.getAttribute('aria-valuenow'))
   }
-  function visible(candidate) {
+  function rendered(candidate) {
     if (candidate.closest('[aria-hidden="true"], [inert]')) return false
     const style = window.getComputedStyle(candidate)
     const rect = candidate.getBoundingClientRect()
     const browserVisible = typeof candidate.checkVisibility === 'function'
       ? candidate.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
       : true
-    const centerX = rect.x + rect.width / 2
-    const centerY = rect.y + rect.height / 2
     return browserVisible
       && style.display !== 'none'
       && style.visibility !== 'hidden'
       && style.opacity !== '0'
       && rect.width > 0
       && rect.height > 0
-      && centerX >= 0
-      && centerY >= 0
-      && centerX < window.innerWidth
-      && centerY < window.innerHeight
   }
   function guardFor(candidate) {
     const select = candidate
@@ -260,7 +267,7 @@ export function checkCurrentAction({ targetId, expectedGuard }) {
     })
   }
 
-  if (!visible(element)) return { ok: false, reason: 'The observed control is no longer visible.' }
+  if (!rendered(element)) return { ok: false, reason: 'The observed control is no longer rendered or available.' }
   if (element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true' || element.closest('[inert]')) {
     return { ok: false, reason: 'The observed control is disabled or inert.' }
   }
