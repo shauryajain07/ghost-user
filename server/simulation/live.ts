@@ -1,0 +1,552 @@
+import { mkdir } from 'node:fs/promises'
+import path from 'node:path'
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright'
+import { executeBrowserAction, observePage, validateBrowserAction } from './browser'
+import { personas as defaultPersonas } from './fixtures'
+import { decideWithJev, isJevAbortError, type JevAgentDecision } from './jev-agent'
+import type {
+  AgentStep,
+  BrowserAction,
+  FrictionIssue,
+  JourneyEdge,
+  JourneyNode,
+  Persona,
+  PersonaResult,
+  RunReport,
+  ScreenshotFrame,
+} from '../types'
+
+export interface LiveSimulationInput {
+  id: string
+  website: string
+  task: string
+  personas: number
+  maxSteps: number
+  assetDir: string
+  signal?: AbortSignal
+  onProgress?: (progress: number, phase: string) => void
+}
+
+interface PersonaRun {
+  result: PersonaResult
+  screenshots: ScreenshotFrame[]
+}
+
+const slug = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'page'
+
+const cleanLabel = (value: string) => value.replace(/\s+/g, ' ').trim()
+
+const pageLabel = (state: { url: string; title: string }) => {
+  try {
+    const parsed = new URL(state.url)
+    if (parsed.pathname === '/' || parsed.pathname === '') return 'Homepage'
+    const segment = parsed.pathname.split('/').filter(Boolean).pop() || parsed.hostname
+    return cleanLabel(segment.replace(/[-_]/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase()))
+  } catch {
+    return state.title || 'Page'
+  }
+}
+
+function stateFingerprint(state: Awaited<ReturnType<typeof observePage>>) {
+  return state.url + '|' + state.title + '|' + state.visibleText.slice(0, 2400) + '|' + state.interactiveElements
+    .map((element) => [element.id, element.type, element.text, element.ariaLabel, element.placeholder, element.href].filter(Boolean).join(':'))
+    .join('|')
+}
+
+function actionLabel(action: BrowserAction) {
+  if (action.type === 'click') return 'Clicked element ' + action.elementId
+  if (action.type === 'type') return 'Typed into element ' + action.elementId
+  if (action.type === 'select') return 'Selected ' + action.value
+  if (action.type === 'scroll') return 'Scrolled ' + action.direction
+  if (action.type === 'press_enter') return 'Pressed Enter'
+  if (action.type === 'reload') return 'Reloaded the page'
+  if (action.type === 'back') return 'Went back'
+  if (action.type === 'forward') return 'Went forward'
+  if (action.type === 'open_tab') return 'Opened a new tab'
+  if (action.type === 'close_tab') return 'Closed the tab'
+  if (action.type === 'wait') return 'Waited for the page'
+  return action.success ? 'Reached protected boundary' : 'Stopped'
+}
+
+function toneFor(action: BrowserAction, confidence: number): AgentStep['tone'] {
+  if (confidence < 0.45) return 'danger'
+  if (confidence < 0.62) return 'warning'
+  return 'neutral'
+}
+
+function decisionLabel(decision: JevAgentDecision) {
+  if (decision.action) return actionLabel(decision.action)
+  if (decision.kind === 'protected') return 'Reached protected boundary'
+  return 'Jev selected ' + decision.actionName
+}
+
+function decisionTone(decision: JevAgentDecision): AgentStep['tone'] {
+  if (decision.kind === 'finish' || decision.kind === 'protected') return 'success'
+  return toneFor(decision.action || { type: 'wait', milliseconds: 0 }, decision.confidence)
+}
+
+async function capture(page: Page, directory: string, runId: string, personaId: string, step: number, label: string, selected: string | undefined, tone: ScreenshotFrame['tone']) {
+  const fileName = personaId + '-' + String(step).padStart(2, '0') + '.png'
+  const filePath = path.join(directory, fileName)
+  try {
+    await page.screenshot({ path: filePath, fullPage: false })
+    return {
+      step,
+      page: label,
+      caption: selected ? 'Selected ' + selected : 'Observed ' + label,
+      selected,
+      tone,
+      src: '/api/run-assets/' + runId + '/' + fileName,
+    } satisfies ScreenshotFrame
+  } catch {
+    return null
+  }
+}
+
+async function simulatePersona(browser: Browser, input: LiveSimulationInput, persona: Persona, index: number, directory: string): Promise<PersonaRun> {
+  const context: BrowserContext = await browser.newContext({
+    viewport: { width: 1280, height: 820 },
+    serviceWorkers: 'block',
+    colorScheme: index % 3 === 0 ? 'light' : 'dark',
+  })
+  let activePage = await context.newPage()
+  activePage.setDefaultTimeout(6500)
+  const timeline: AgentStep[] = []
+  const screenshots: ScreenshotFrame[] = []
+  const pathHistory: string[] = []
+  const history: { page: string; action: string; outcome: string }[] = []
+  const avoidTargetIds = new Set<string>()
+  let currentState: Awaited<ReturnType<typeof observePage>>
+  let outcome: PersonaResult['outcome'] = 'failed'
+  let primaryProblem = 'The user reached the step limit without finding a confident path.'
+  let backtracks = 0
+  const startedAt = Date.now()
+
+  try {
+    await activePage.goto(input.website, { waitUntil: 'domcontentloaded', timeout: 15000 })
+    currentState = await observePage(activePage)
+    pathHistory.push(pageLabel(currentState))
+    const firstShot = await capture(activePage, directory, input.id, persona.id, 1, pageLabel(currentState), undefined, 'neutral')
+    if (firstShot) screenshots.push(firstShot)
+
+    for (let step = 1; step <= input.maxSteps; step += 1) {
+      if (input.signal?.aborted) throw new Error('Run cancelled.')
+      let decision: JevAgentDecision
+      try {
+        decision = await decideWithJev({
+          task: input.task,
+          persona,
+          state: currentState,
+          history,
+          avoidTargetIds: [...avoidTargetIds],
+          step,
+          maxSteps: input.maxSteps,
+          signal: input.signal,
+        })
+      } catch (error) {
+        if (input.signal?.aborted || isJevAbortError(error)) throw error
+        const message = error instanceof Error ? error.message : 'Jev could not decide the next action.'
+        primaryProblem = message
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: 'Jev decision failed',
+          actionDetail: 'The JEV request did not return a decision',
+          reasoningSummary: message,
+          confidence: 0,
+          expectedOutcome: 'Receive a typed JEV action for the current page.',
+          actualOutcome: message,
+          timeMs: 0,
+          tone: 'danger',
+        })
+        break
+      }
+
+      const actionTone = decisionTone(decision)
+      const decisionReason = decision.summary + ' · ' + decision.model + ' · ' + decision.latencyMs + 'ms'
+      let actualOutcome = 'No action was executed.'
+      let timeMs = 0
+
+      if (decision.kind === 'protected') {
+        outcome = 'protected'
+        primaryProblem = decision.actualOutcome || decision.summary
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          actionDetail: 'Stopped before a protected or destructive action',
+          reasoningSummary: decisionReason,
+          confidence: decision.confidence,
+          expectedOutcome: decision.expectedOutcome,
+          actualOutcome: primaryProblem,
+          timeMs,
+          tone: actionTone,
+        })
+        const shot = await capture(activePage, directory, input.id, persona.id, step, pageLabel(currentState), undefined, 'success')
+        if (shot) screenshots.push(shot)
+        break
+      }
+
+      if (decision.kind === 'finish') {
+        outcome = 'completed'
+        primaryProblem = 'Jev judged the requested outcome complete from the current page.'
+        actualOutcome = primaryProblem
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          actionDetail: 'Jev marked the requested outcome as visible',
+          reasoningSummary: decisionReason,
+          confidence: decision.confidence,
+          expectedOutcome: decision.expectedOutcome,
+          actualOutcome,
+          timeMs,
+          tone: 'success',
+        })
+        const shot = await capture(activePage, directory, input.id, persona.id, step, pageLabel(currentState), undefined, 'success')
+        if (shot) screenshots.push(shot)
+        break
+      }
+
+      if (!decision.action) {
+        const targetAction = decision.actionName === 'click' || decision.actionName === 'type' || decision.actionName === 'select'
+        if (targetAction && decision.targetId && step < input.maxSteps) {
+          avoidTargetIds.add(decision.targetId)
+          const retryOutcome = 'Jev was unsure about this target, so the persona skipped it and asked JEV to reassess the other visible controls.'
+          history.push({ page: pageLabel(currentState), action: decisionLabel(decision), outcome: retryOutcome })
+          timeline.push({
+            step,
+            page: currentState.url,
+            pageLabel: pageLabel(currentState),
+            action: decisionLabel(decision),
+            actionDetail: 'Skipped an ambiguous target and reassessed the page',
+            reasoningSummary: decisionReason,
+            confidence: decision.confidence,
+            expectedOutcome: decision.expectedOutcome,
+            actualOutcome: retryOutcome,
+            timeMs,
+            tone: 'warning',
+          })
+          continue
+        }
+        primaryProblem = decision.summary
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          actionDetail: 'No executable action was selected',
+          reasoningSummary: decisionReason,
+          confidence: decision.confidence,
+          expectedOutcome: decision.expectedOutcome,
+          actualOutcome: primaryProblem,
+          timeMs,
+          tone: actionTone,
+        })
+        break
+      }
+
+      const validation = validateBrowserAction(decision.action, currentState)
+      if (!validation.ok) {
+        actualOutcome = validation.reason
+        primaryProblem = validation.reason
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          actionDetail: 'Action blocked by the safety validator',
+          reasoningSummary: decisionReason,
+          confidence: decision.confidence,
+          expectedOutcome: decision.expectedOutcome,
+          actualOutcome,
+          timeMs,
+          tone: 'danger',
+        })
+        break
+      }
+
+      const beforeUrl = currentState.url
+      const beforeLabel = pageLabel(currentState)
+      const beforeFingerprint = stateFingerprint(currentState)
+      const selectedElementId = decision.action.type === 'click' || decision.action.type === 'type' || decision.action.type === 'select'
+        ? decision.action.elementId
+        : undefined
+      const selectedElement = selectedElementId
+        ? currentState.interactiveElements.find((element) => element.id === selectedElementId)
+        : undefined
+      const selectedText = selectedElement?.text || selectedElement?.ariaLabel || selectedElement?.placeholder
+      const actionStarted = Date.now()
+      try {
+        actualOutcome = await executeBrowserAction(activePage, currentState, decision.action)
+        timeMs = Date.now() - actionStarted
+      } catch (error) {
+        actualOutcome = error instanceof Error ? error.message : 'The browser action failed.'
+        timeMs = Date.now() - actionStarted
+        primaryProblem = actualOutcome
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          actionDetail: 'The browser could not complete the action',
+          reasoningSummary: decisionReason,
+          confidence: decision.confidence,
+          expectedOutcome: decision.expectedOutcome,
+          actualOutcome,
+          timeMs,
+          tone: 'danger',
+        })
+        break
+      }
+
+      if (decision.action.type === 'back') backtracks += 1
+      await activePage.waitForTimeout(220).catch(() => undefined)
+      const openPages = context.pages().filter((candidate) => !candidate.isClosed())
+      if (activePage.isClosed() || decision.action.type === 'open_tab' || decision.action.type === 'close_tab') {
+        activePage = openPages[openPages.length - 1] || await context.newPage()
+        activePage.setDefaultTimeout(6500)
+      }
+      currentState = await observePage(activePage)
+      const currentLabel = pageLabel(currentState)
+      const pageChanged = currentState.url !== beforeUrl || stateFingerprint(currentState) !== beforeFingerprint
+      if (pageChanged && currentState.url !== beforeUrl) avoidTargetIds.clear()
+      if (!pageChanged && selectedElementId && (decision.action.type === 'click' || decision.action.type === 'type' || decision.action.type === 'select')) {
+        avoidTargetIds.add(selectedElementId)
+        actualOutcome += ' The page state did not change, so JEV will avoid repeating this control.'
+      }
+      history.push({ page: beforeLabel, action: decisionLabel(decision), outcome: actualOutcome })
+      if (currentLabel !== pathHistory[pathHistory.length - 1] || currentState.url !== beforeUrl || decision.action.type === 'back') pathHistory.push(currentLabel)
+      timeline.push({
+        step,
+        page: beforeUrl,
+        pageLabel: beforeLabel,
+        action: decisionLabel(decision),
+        actionDetail: selectedText || actualOutcome,
+        reasoningSummary: decisionReason,
+        confidence: decision.confidence,
+        expectedOutcome: decision.expectedOutcome,
+        actualOutcome,
+        timeMs,
+        tone: actionTone,
+      })
+      if (decision.confidence < 0.62 || decision.action.type === 'scroll' || step === 2) {
+        const shot = await capture(activePage, directory, input.id, persona.id, step, currentLabel, selectedText, actionTone === 'danger' ? 'warning' : actionTone === 'success' ? 'success' : 'warning')
+        if (shot) screenshots.push(shot)
+      }
+    }
+  } catch (error) {
+    primaryProblem = error instanceof Error ? error.message : 'The browser session failed to load.'
+  } finally {
+    await context.close().catch(() => undefined)
+  }
+
+  if (outcome === 'failed' && timeline.some((step) => step.action.includes('Reached protected boundary'))) outcome = 'protected'
+  const confidence = timeline.length
+    ? timeline.reduce((sum, step) => sum + step.confidence, 0) / timeline.length
+    : 0
+  const duration = Math.max(1, Math.round((Date.now() - startedAt) / 1000))
+  return {
+    result: {
+      ...persona,
+      outcome,
+      outcomeLabel: outcome === 'completed' ? 'Completed' : outcome === 'protected' ? 'Protected boundary' : 'Failed',
+      steps: timeline.length,
+      confidence,
+      backtracks,
+      duration: '0m ' + duration + 's',
+      path: pathHistory,
+      primaryProblem,
+      confidenceDrop: timeline.length > 1 && timeline[timeline.length - 1].confidence < timeline[0].confidence - 0.2
+        ? 'Step ' + timeline.length + ' · ' + Math.round(timeline[0].confidence * 100) + '% → ' + Math.round(timeline[timeline.length - 1].confidence * 100) + '%'
+        : undefined,
+      timeline,
+    },
+    screenshots,
+  }
+}
+
+function buildJourneyData(results: PersonaResult[]): { nodes: JourneyNode[]; edges: JourneyEdge[]; bestPath: string[] } {
+  const nodeCounts = new Map<string, number>()
+  const edgeCounts = new Map<string, { from: string; to: string; count: number }>()
+  results.forEach((result) => {
+    result.path.forEach((label, index) => {
+      nodeCounts.set(label, (nodeCounts.get(label) || 0) + 1)
+      if (index > 0) {
+        const from = result.path[index - 1]
+        const key = from + '::' + label
+        const edge = edgeCounts.get(key) || { from, to: label, count: 0 }
+        edge.count += 1
+        edgeCounts.set(key, edge)
+      }
+    })
+  })
+  const labels = [...nodeCounts.keys()].slice(0, 9)
+  const maxCount = results.length || 1
+  const nodes = labels.map((label, index) => ({
+    id: slug(label),
+    label,
+    meta: Math.round((nodeCounts.get(label) || 0) / maxCount * 100) + '% · ' + (nodeCounts.get(label) || 0) + ' users',
+    x: [10, 37, 64, 88][Math.min(3, index % 4)],
+    y: index % 4 === 0 ? 50 : index % 2 ? 28 : 74,
+    tone: /abandon|fail|back|error/i.test(label) ? 'red' : index === 0 ? 'default' : 'lime',
+  })) as JourneyNode[]
+  const edges = [...edgeCounts.values()].slice(0, 14).map((edge) => ({
+    from: slug(edge.from),
+    to: slug(edge.to),
+    label: Math.round(edge.count / maxCount * 100) + '%',
+    tone: /back|fail|abandon/i.test(edge.to) ? 'red' : 'lime',
+  })) as JourneyEdge[]
+  const bestPath = results
+    .filter((result) => result.outcome !== 'failed')
+    .sort((a, b) => a.steps - b.steps)[0]?.path || results[0]?.path || []
+  return { nodes, edges, bestPath }
+}
+
+function buildLiveIssues(results: PersonaResult[]): FrictionIssue[] {
+  const failed = results.filter((result) => result.outcome === 'failed')
+  const backtracked = results.filter((result) => result.backtracks > 0)
+  const hesitant = results.filter((result) => result.confidence < 0.58)
+  const issues: FrictionIssue[] = []
+  if (failed.length) {
+    issues.push({
+      id: 'live-failure',
+      page: failed[0].path[failed[0].path.length - 1] || 'Unknown',
+      title: 'Some users did not reach a confident task boundary',
+      description: 'These sessions ended after the agent could not find a reliable next action within the configured step limit.',
+      usersAffected: failed.length,
+      severity: failed.length >= Math.ceil(results.length / 3) ? 'High' : 'Medium',
+      severityTone: failed.length >= Math.ceil(results.length / 3) ? 'high' : 'medium',
+      evidence: [
+        failed.length + ' users failed before the task boundary',
+        Math.round(failed.reduce((sum, result) => sum + result.confidence, 0) / failed.length * 100) + '% average confidence on failed sessions',
+        failed[0].primaryProblem,
+      ],
+      recommendation: 'Make the next task-relevant action more visible and use labels that match the user’s goal.',
+    })
+  }
+  if (backtracked.length) {
+    issues.push({
+      id: 'live-backtrack',
+      page: backtracked[0].path[0] || 'Homepage',
+      title: 'Users changed direction during navigation',
+      description: 'The path included a return action or an unsuccessful click, which is a signal that the information architecture was not self-evident.',
+      usersAffected: backtracked.length,
+      severity: 'Medium',
+      severityTone: 'medium',
+      evidence: [
+        backtracked.length + ' users backtracked or retried a control',
+        'Most common path: ' + backtracked[0].path.join(' → '),
+        'Average backtracks: ' + (backtracked.reduce((sum, result) => sum + result.backtracks, 0) / backtracked.length).toFixed(1),
+      ],
+      recommendation: 'Reduce competing routes and clarify the label of the primary task path.',
+    })
+  }
+  if (hesitant.length) {
+    issues.push({
+      id: 'live-ambiguity',
+      page: hesitant[0].timeline.find((step) => step.confidence < 0.58)?.pageLabel || 'Unknown',
+      title: 'The next action was ambiguous',
+      description: 'Several persona decisions fell below the confidence threshold used for an unambiguous interaction.',
+      usersAffected: hesitant.length,
+      severity: 'Low',
+      severityTone: 'low',
+      evidence: [
+        hesitant.length + ' users had an average confidence below 58%',
+        'Lowest observed decision: ' + Math.round(Math.min(...hesitant.map((result) => result.confidence)) * 100) + '%',
+        'The ambiguity appeared before the final task boundary.',
+      ],
+      recommendation: 'Strengthen visual hierarchy around the action that best matches the task language.',
+    })
+  }
+  if (!issues.length) {
+    issues.push({
+      id: 'live-clear',
+      page: 'All pages',
+      title: 'No systemic friction detected',
+      description: 'Every simulated user found a reasonable route without repeated backtracking or protected-action confusion.',
+      usersAffected: 0,
+      severity: 'Low',
+      severityTone: 'low',
+      evidence: ['All sessions reached a task boundary', 'No repeated action loops detected', 'Confidence stayed above the ambiguity threshold'],
+      recommendation: 'Keep the current information hierarchy and continue testing with more task types.',
+    })
+  }
+  return issues
+}
+
+function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[]): RunReport {
+  const results = runs.map((run) => run.result)
+  const total = results.length
+  const completed = results.filter((result) => result.outcome !== 'failed').length
+  const avg = (values: number[]) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0
+  const journey = buildJourneyData(results)
+  const screenshots = runs.flatMap((run) => run.screenshots).slice(0, 8)
+  const domain = new URL(input.website).hostname.replace(/^www\./, '')
+  const successful = results.filter((result) => result.outcome !== 'failed')
+  return {
+    id: input.id,
+    status: 'complete',
+    executionMode: 'live',
+    progress: 100,
+    phase: 'Live report ready',
+    website: input.website,
+    domain,
+    task: input.task,
+    createdAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(),
+    personasCount: total,
+    maxSteps: input.maxSteps,
+    metrics: {
+      completed,
+      total,
+      completionRate: total ? Math.round(completed / total * 100) : 0,
+      avgSteps: Number(avg(results.map((result) => result.steps)).toFixed(1)),
+      successfulAvgSteps: Number(avg(successful.map((result) => result.steps)).toFixed(1)),
+      failedAvgSteps: Number(avg(results.filter((result) => result.outcome === 'failed').map((result) => result.steps)).toFixed(1)),
+      avgConfidence: Math.round(avg(results.map((result) => result.confidence)) * 100),
+      avgBacktracks: Number(avg(results.map((result) => result.backtracks)).toFixed(1)),
+      biggestDropOff: results.find((result) => result.outcome === 'failed')?.path.slice(-2).join(' → ') || 'No major drop-off',
+      biggestDropOffCount: results.filter((result) => result.outcome === 'failed').length,
+      sessionDuration: Math.round(avg(results.map((result) => Number(result.duration.replace(/\D/g, '') || 0)))) + 's',
+    },
+    summary: completed + ' of ' + total + ' simulated users reached a task boundary on the live site.',
+    summaryAccent: results.some((result) => result.outcome === 'failed')
+      ? 'The report highlights the exact routes where users lost confidence.'
+      : 'The current task path was clear across the tested personas.',
+    issues: buildLiveIssues(results),
+    personas: results,
+    journeyNodes: journey.nodes,
+    journeyEdges: journey.edges,
+    screenshots,
+    bestPath: journey.bestPath,
+    guardrailNote: 'Live sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
+  }
+}
+
+export async function runLiveSimulation(input: LiveSimulationInput): Promise<RunReport> {
+  await mkdir(path.join(input.assetDir, input.id), { recursive: true })
+  input.onProgress?.(8, 'Opening isolated browser contexts')
+  const browser = await chromium.launch({ headless: true })
+  const selected = defaultPersonas.slice(0, Math.max(5, Math.min(input.personas, defaultPersonas.length)))
+  const runs: PersonaRun[] = []
+  try {
+    const concurrency = 3
+    for (let start = 0; start < selected.length; start += concurrency) {
+      if (input.signal?.aborted) throw new Error('Run cancelled.')
+      const batch = selected.slice(start, start + concurrency)
+      const batchResults = await Promise.all(batch.map((persona, offset) =>
+        simulatePersona(browser, input, persona, start + offset, path.join(input.assetDir, input.id)),
+      ))
+      runs.push(...batchResults)
+      input.onProgress?.(15 + Math.round(runs.length / selected.length * 72), 'Running live browser sessions · ' + runs.length + '/' + selected.length)
+    }
+    input.onProgress?.(93, 'Clustering live friction')
+    return buildLiveReport(input, runs)
+  } finally {
+    await browser.close().catch(() => undefined)
+  }
+}
