@@ -15,6 +15,7 @@ import type {
   PersonaResult,
   RunReport,
   ScreenshotFrame,
+  LiveAgentState,
 } from '../types'
 
 export interface LiveSimulationInput {
@@ -442,11 +443,8 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
         timeMs,
         tone: actionTone,
       })
-      let actionShot: ScreenshotFrame | null = null
-      if (decision.confidence < 0.62 || decision.action.type === 'scroll' || step === 2) {
-        actionShot = await capture(activePage, directory, input.id, persona.id, step, currentLabel, selectedText, actionTone === 'danger' ? 'warning' : actionTone === 'success' ? 'success' : 'warning', 'action')
-        if (actionShot) screenshots.push(actionShot)
-      }
+      const actionShot = await capture(activePage, directory, input.id, persona.id, step, currentLabel, selectedText, actionTone === 'danger' ? 'warning' : actionTone === 'success' ? 'success' : 'warning', 'action')
+      if (actionShot) screenshots.push(actionShot)
       emitLiveEvent(input, {
         kind: 'action',
         personaId: persona.id,
@@ -601,6 +599,32 @@ function buildLiveIssues(results: PersonaResult[]): FrictionIssue[] {
   return issues
 }
 
+function buildLiveAgentStates(results: PersonaResult[], liveEvents: LiveEvent[]): LiveAgentState[] {
+  return results.map((result) => {
+    const personaEvents = liveEvents.filter((event) => event.personaId === result.id)
+    const lastEvent = personaEvents[personaEvents.length - 1]
+    const screenshotEvent = [...personaEvents].reverse().find((event) => event.screenshotSrc)
+    const status: LiveAgentState['status'] = result.outcome === 'completed'
+      ? 'completed'
+      : result.outcome === 'protected'
+        ? 'blocked'
+        : 'failed'
+    return {
+      id: result.id,
+      name: result.name,
+      initials: result.initials,
+      color: result.color,
+      status,
+      step: lastEvent?.step ?? result.steps,
+      pageLabel: lastEvent?.pageLabel || result.path[result.path.length - 1] || 'Session ended',
+      action: lastEvent?.action || result.outcomeLabel,
+      confidence: lastEvent?.confidence ?? result.confidence,
+      screenshotSrc: screenshotEvent?.screenshotSrc,
+      lastEventAt: lastEvent?.at,
+    }
+  })
+}
+
 function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[], liveEvents: LiveEvent[]): RunReport {
   const results = runs.map((run) => run.result)
   const total = results.length
@@ -646,6 +670,7 @@ function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[], liveEve
     journeyEdges: journey.edges,
     screenshots,
     liveEvents,
+    liveAgents: buildLiveAgentStates(results, liveEvents),
     bestPath: journey.bestPath,
     guardrailNote: 'Live sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
   }
@@ -653,8 +678,8 @@ function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[], liveEve
 
 export async function runLiveSimulation(input: LiveSimulationInput): Promise<RunReport> {
   await mkdir(path.join(input.assetDir, input.id), { recursive: true })
-  const headless = process.env.GHOST_USER_HEADLESS === '1'
-  input.onProgress?.(8, headless ? 'Opening isolated browser contexts' : 'Opening visible Chrome session')
+  const headless = process.env.GHOST_USER_HEADLESS !== '0'
+  input.onProgress?.(8, headless ? 'Starting hidden browser sessions' : 'Opening visible Chrome session')
   const browser = await launchSimulationBrowser(headless)
   const selected = defaultPersonas.slice(0, Math.max(5, Math.min(input.personas, defaultPersonas.length)))
   const runs: PersonaRun[] = []

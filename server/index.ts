@@ -2,10 +2,10 @@ import 'dotenv/config'
 import path from 'node:path'
 import cors from 'cors'
 import express from 'express'
-import { buildDemoReport } from './simulation/fixtures'
+import { buildDemoReport, personas as simulationPersonas } from './simulation/fixtures'
 import { runLiveSimulation } from './simulation/live'
 import { hasJevApiKey, JEV_MODEL } from './simulation/jev-agent'
-import type { CreateRunInput, RunReport, RunStatus } from './types'
+import type { CreateRunInput, LiveAgentState, LiveEvent, RunReport, RunStatus } from './types'
 
 const app = express()
 const port = Number(process.env.PORT ?? 8787)
@@ -40,6 +40,40 @@ const setRunState = (run: RunReport, status: RunStatus, progress: number, phase:
   runs.set(run.id, run)
 }
 
+const liveAgentStatusForEvent = (event: LiveEvent): LiveAgentState['status'] => {
+  if (event.kind === 'finish') return 'completed'
+  if (event.kind === 'protected') return 'blocked'
+  if (event.kind === 'error') return 'failed'
+  return 'running'
+}
+
+const createLiveAgents = (count: number): LiveAgentState[] => simulationPersonas.slice(0, count).map((persona) => ({
+  id: persona.id,
+  name: persona.name,
+  initials: persona.initials,
+  color: persona.color,
+  status: 'queued',
+  step: 0,
+  pageLabel: 'Queued',
+  action: 'Waiting for an isolated browser session',
+  confidence: 0,
+}))
+
+const updateLiveAgent = (run: RunReport, event: LiveEvent) => {
+  run.liveAgents = (run.liveAgents || []).map((agent) => agent.id === event.personaId
+    ? {
+        ...agent,
+        status: liveAgentStatusForEvent(event),
+        step: event.step,
+        pageLabel: event.pageLabel,
+        action: event.action,
+        confidence: event.confidence,
+        screenshotSrc: event.screenshotSrc || agent.screenshotSrc,
+        lastEventAt: event.at,
+      }
+    : agent)
+}
+
 const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
   const controller = new AbortController()
   controllers.set(run.id, controller)
@@ -55,6 +89,7 @@ const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
     onEvent: (event) => {
       if (!controllers.has(run.id)) return
       run.liveEvents = [...(run.liveEvents || []), event].slice(-240)
+      updateLiveAgent(run, event)
       run.phase = event.personaName + ' · ' + event.action
       runs.set(run.id, run)
     },
@@ -71,6 +106,7 @@ const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
     fallback.errorMessage = error instanceof Error ? error.message : 'The live browser run could not complete.'
     fallback.guardrailNote = 'The live browser run could not complete, so this report is a clearly labeled preview. No external action was submitted.'
     fallback.liveEvents = run.liveEvents || []
+    fallback.liveAgents = run.liveAgents || []
     runs.set(run.id, fallback)
   })
 }
@@ -130,6 +166,7 @@ app.post('/api/runs', (req, res) => {
       journeyEdges: [],
       screenshots: [],
       liveEvents: [],
+      liveAgents: createLiveAgents(input.personas),
       bestPath: [],
       guardrailNote: 'JEV-driven sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
     }

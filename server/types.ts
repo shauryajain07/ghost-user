@@ -127,6 +127,22 @@ export interface LiveEvent {
   screenshotSrc?: string
 }
 
+export type LiveAgentStatus = 'queued' | 'running' | 'completed' | 'blocked' | 'failed'
+
+export interface LiveAgentState {
+  id: string
+  name: string
+  initials: string
+  color: string
+  status: LiveAgentStatus
+  step: number
+  pageLabel: string
+  action: string
+  confidence: number
+  screenshotSrc?: string
+  lastEventAt?: string
+}
+
 export interface RunMetrics {
   completed: number
   total: number
@@ -163,6 +179,7 @@ export interface RunReport {
   journeyEdges: JourneyEdge[]
   screenshots: ScreenshotFrame[]
   liveEvents?: LiveEvent[]
+  liveAgents?: LiveAgentState[]
   bestPath: string[]
   guardrailNote: string
   errorMessage?: string

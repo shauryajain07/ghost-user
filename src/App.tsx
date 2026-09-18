@@ -36,7 +36,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import type { FrictionIssue, LiveEvent, PersonaResult, RunReport, RunStatus, ScreenshotFrame } from '../server/types'
+import type { FrictionIssue, LiveAgentState, LiveEvent, PersonaResult, RunReport, RunStatus, ScreenshotFrame } from '../server/types'
 
 type View = 'new' | 'report' | 'reports'
 type ReportTab = 'overview' | 'journeys' | 'friction' | 'personas'
@@ -463,9 +463,7 @@ function PromiseRow({ icon, title, text }: { icon: ReactNode; title: string; tex
 function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => void }) {
   const events = run.liveEvents || []
   const recentEvents = [...events].reverse().slice(0, 14)
-  const latestEvent = events[events.length - 1]
-  const latestScreenshot = [...events].reverse().find((event) => event.screenshotSrc)
-  const personaStates = [...new Map(events.filter((event) => event.personaId).map((event) => [event.personaId, event])).values()]
+  const agents = liveAgentsFromRun(run, events)
 
   return (
     <div className="modal-scrim">
@@ -474,7 +472,7 @@ function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => v
         <div className="progress-orb"><div className="orb-core"><Ghost size={26} /></div><div className="orb-ring ring-one" /><div className="orb-ring ring-two" /></div>
         <span className="card-kicker">{run.personasCount} AI USERS ARE EXPLORING</span>
         <h2>Watching them find their way.</h2>
-        <p className="progress-copy">A headed Chrome session is taking the same actions shown below. Each persona has an isolated session and can click, type, scroll, change their mind, and stop when the path no longer makes sense.</p>
+        <p className="progress-copy">Hidden browser sessions are taking the same actions shown below. Watch the latest frame from every persona without opening a Chrome window. Each session is isolated and can click, type, scroll, change its mind, and stop when the path no longer makes sense.</p>
         <div className="progress-status-row"><span><span className="status-pulse" /> {run.phase}</span><strong>{run.progress}%</strong></div>
         <div className="progress-track"><div className="progress-fill" style={{ width: run.progress + '%' }} /></div>
         <div className="progress-steps">
@@ -484,29 +482,77 @@ function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => v
           <ProgressStep label="Write report" done={false} active={run.progress > 91} />
         </div>
         <div className="live-console">
+          <div className="live-console-card live-stream-card">
+            <div className="live-console-head"><span><Eye size={13} /> LIVE AGENT STREAM</span><small>{agents.filter((agent) => agent.screenshotSrc).length}/{agents.length} frames · background browser</small></div>
+            <div className="live-agent-grid">
+              {agents.length ? agents.map((agent) => <LiveAgentTile key={agent.id} agent={agent} />) : <div className="live-empty"><Loader2 size={15} className="spin" /> Preparing agent streams…</div>}
+            </div>
+          </div>
           <div className="live-console-card live-feed-card">
             <div className="live-console-head"><span><Activity size={13} /> LIVE ACTION FEED</span><small>{events.length} signals</small></div>
             <div className="live-event-list">
               {recentEvents.length ? recentEvents.map((event) => <LiveEventRow key={event.id} event={event} />) : <div className="live-empty"><Loader2 size={15} className="spin" /> Waiting for the first JEV decision…</div>}
             </div>
           </div>
-          <div className="live-preview-column">
-            <div className="live-console-card live-preview-card">
-              <div className="live-console-head"><span><Eye size={13} /> LIVE BROWSER FRAME</span><small>{latestEvent?.pageLabel || 'Connecting'}</small></div>
-              {latestScreenshot?.screenshotSrc ? <img className="live-preview-image" src={latestScreenshot.screenshotSrc} alt="Latest browser frame from the live persona session" /> : <div className="live-preview-empty"><Globe2 size={22} /><span>Waiting for the browser frame</span></div>}
-              <div className="live-preview-meta"><strong>{latestEvent?.personaName || 'Preparing personas'}</strong><span>{latestEvent ? latestEvent.action : 'Opening Chrome…'}</span></div>
-            </div>
-            <div className="live-console-card live-persona-card">
-              <div className="live-console-head"><span><Users size={13} /> PERSONAS IN PROGRESS</span><small>{personaStates.length}/{run.personasCount}</small></div>
-              <div className="live-persona-list">
-                {personaStates.length ? personaStates.slice(0, 6).map((event) => <div className="live-persona-row" key={event.personaId}><span className={'live-persona-dot ' + liveEventTone(event)} /><span>{event.personaName}</span><small>step {event.step}</small></div>) : <div className="live-persona-placeholder">Sessions will appear as Chrome opens.</div>}
-              </div>
-            </div>
-          </div>
         </div>
         <button className="cancel-button" onClick={onCancel}>Stop simulation</button>
       </div>
     </div>
+  )
+}
+
+const liveAgentColors = ['#d7ff65', '#ffbd7d', '#9cb6ff', '#f49bd6', '#c1a6ff', '#80e6cf', '#91d0ff', '#ff9a9a']
+
+function liveAgentsFromRun(run: RunReport, events: LiveEvent[]): LiveAgentState[] {
+  const agents = new Map((run.liveAgents || []).map((agent) => [agent.id, agent]))
+  events.forEach((event) => {
+    if (agents.has(event.personaId)) return
+    const initials = event.personaName.split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase()
+    agents.set(event.personaId, {
+      id: event.personaId,
+      name: event.personaName,
+      initials,
+      color: liveAgentColors[agents.size % liveAgentColors.length],
+      status: liveEventStatus(event),
+      step: event.step,
+      pageLabel: event.pageLabel,
+      action: event.action,
+      confidence: event.confidence,
+      screenshotSrc: event.screenshotSrc,
+      lastEventAt: event.at,
+    })
+  })
+  return [...agents.values()]
+}
+
+function liveEventStatus(event: LiveEvent): LiveAgentState['status'] {
+  if (event.kind === 'finish') return 'completed'
+  if (event.kind === 'protected') return 'blocked'
+  if (event.kind === 'error') return 'failed'
+  return 'running'
+}
+
+function liveAgentStatusLabel(status: LiveAgentState['status']) {
+  if (status === 'queued') return 'Queued'
+  if (status === 'running') return 'Live'
+  if (status === 'completed') return 'Complete'
+  if (status === 'blocked') return 'Protected'
+  return 'Error'
+}
+
+function LiveAgentTile({ agent }: { agent: LiveAgentState }) {
+  return (
+    <article className={'live-agent-tile ' + agent.status}>
+      <div className="live-agent-frame">
+        {agent.screenshotSrc ? <img src={agent.screenshotSrc} alt={agent.name + ' browser frame'} /> : <div className="live-agent-empty"><Loader2 size={16} className={agent.status === 'queued' ? 'spin' : ''} /><span>{agent.status === 'queued' ? 'Waiting' : 'Frame unavailable'}</span></div>}
+        <span className="live-agent-badge"><i />{liveAgentStatusLabel(agent.status)}</span>
+      </div>
+      <div className="live-agent-info">
+        <div className="live-agent-name"><span className="live-agent-avatar" style={{ background: agent.color }}>{agent.initials}</span><strong>{agent.name}</strong><small>step {agent.step}</small></div>
+        <div className="live-agent-action" title={agent.action}>{agent.action}</div>
+        <div className="live-agent-meta"><span>{agent.pageLabel}</span><span>{Math.round(agent.confidence * 100)}%</span></div>
+      </div>
+    </article>
   )
 }
 
