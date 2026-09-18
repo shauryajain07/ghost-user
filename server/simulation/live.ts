@@ -8,6 +8,7 @@ import type {
   AgentStep,
   BrowserAction,
   FrictionIssue,
+  LiveEvent,
   JourneyEdge,
   JourneyNode,
   Persona,
@@ -25,6 +26,7 @@ export interface LiveSimulationInput {
   assetDir: string
   signal?: AbortSignal
   onProgress?: (progress: number, phase: string) => void
+  onEvent?: (event: LiveEvent) => void
 }
 
 interface PersonaRun {
@@ -85,8 +87,28 @@ function decisionTone(decision: JevAgentDecision): AgentStep['tone'] {
   return toneFor(decision.action || { type: 'wait', milliseconds: 0 }, decision.confidence)
 }
 
-async function capture(page: Page, directory: string, runId: string, personaId: string, step: number, label: string, selected: string | undefined, tone: ScreenshotFrame['tone']) {
-  const fileName = personaId + '-' + String(step).padStart(2, '0') + '.png'
+function emitLiveEvent(input: LiveSimulationInput, event: Omit<LiveEvent, 'id' | 'at'>) {
+  input.onEvent?.({
+    id: 'evt_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7),
+    at: new Date().toISOString(),
+    ...event,
+  })
+}
+
+async function launchSimulationBrowser(headless: boolean) {
+  const args = headless ? [] : ['--window-size=1440,960', '--window-position=80,60']
+  if (!headless) {
+    try {
+      return await chromium.launch({ channel: 'chrome', headless: false, args })
+    } catch {
+      // Fall back to Playwright's bundled Chromium when Google Chrome is unavailable.
+    }
+  }
+  return chromium.launch({ headless, args })
+}
+
+async function capture(page: Page, directory: string, runId: string, personaId: string, step: number, label: string, selected: string | undefined, tone: ScreenshotFrame['tone'], variant: 'initial' | 'action' | 'boundary') {
+  const fileName = personaId + '-' + String(step).padStart(2, '0') + '-' + variant + '.png'
   const filePath = path.join(directory, fileName)
   try {
     await page.screenshot({ path: filePath, fullPage: false })
@@ -126,8 +148,20 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
     await activePage.goto(input.website, { waitUntil: 'domcontentloaded', timeout: 15000 })
     currentState = await observePage(activePage)
     pathHistory.push(pageLabel(currentState))
-    const firstShot = await capture(activePage, directory, input.id, persona.id, 1, pageLabel(currentState), undefined, 'neutral')
+    const firstShot = await capture(activePage, directory, input.id, persona.id, 1, pageLabel(currentState), undefined, 'neutral', 'initial')
     if (firstShot) screenshots.push(firstShot)
+    emitLiveEvent(input, {
+      kind: 'observation',
+      personaId: persona.id,
+      personaName: persona.name,
+      step: 0,
+      page: currentState.url,
+      pageLabel: pageLabel(currentState),
+      action: 'Observed page',
+      detail: currentState.title || 'Loaded the starting page.',
+      confidence: 1,
+      screenshotSrc: firstShot?.src,
+    })
 
     for (let step = 1; step <= input.maxSteps; step += 1) {
       if (input.signal?.aborted) throw new Error('Run cancelled.')
@@ -160,11 +194,34 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
           timeMs: 0,
           tone: 'danger',
         })
+        emitLiveEvent(input, {
+          kind: 'error',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: 'JEV decision failed',
+          detail: message,
+          confidence: 0,
+        })
         break
       }
 
       const actionTone = decisionTone(decision)
       const decisionReason = decision.summary + ' · ' + decision.model + ' · ' + decision.latencyMs + 'ms'
+      emitLiveEvent(input, {
+        kind: 'decision',
+        personaId: persona.id,
+        personaName: persona.name,
+        step,
+        page: currentState.url,
+        pageLabel: pageLabel(currentState),
+        action: decisionLabel(decision),
+        detail: decisionReason,
+        confidence: decision.confidence,
+        latencyMs: decision.latencyMs,
+      })
       let actualOutcome = 'No action was executed.'
       let timeMs = 0
 
@@ -184,8 +241,21 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
           timeMs,
           tone: actionTone,
         })
-        const shot = await capture(activePage, directory, input.id, persona.id, step, pageLabel(currentState), undefined, 'success')
+        const shot = await capture(activePage, directory, input.id, persona.id, step, pageLabel(currentState), undefined, 'success', 'boundary')
         if (shot) screenshots.push(shot)
+        emitLiveEvent(input, {
+          kind: 'protected',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          detail: primaryProblem,
+          confidence: decision.confidence,
+          latencyMs: decision.latencyMs,
+          screenshotSrc: shot?.src,
+        })
         break
       }
 
@@ -206,16 +276,31 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
           timeMs,
           tone: 'success',
         })
-        const shot = await capture(activePage, directory, input.id, persona.id, step, pageLabel(currentState), undefined, 'success')
+        const shot = await capture(activePage, directory, input.id, persona.id, step, pageLabel(currentState), undefined, 'success', 'boundary')
         if (shot) screenshots.push(shot)
+        emitLiveEvent(input, {
+          kind: 'finish',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          detail: actualOutcome,
+          confidence: decision.confidence,
+          latencyMs: decision.latencyMs,
+          screenshotSrc: shot?.src,
+        })
         break
       }
 
       if (!decision.action) {
         const targetAction = decision.actionName === 'click' || decision.actionName === 'type' || decision.actionName === 'select'
-        if (targetAction && decision.targetId && step < input.maxSteps) {
-          avoidTargetIds.add(decision.targetId)
-          const retryOutcome = 'Jev was unsure about this target, so the persona skipped it and asked JEV to reassess the other visible controls.'
+        if (targetAction && step < input.maxSteps) {
+          if (decision.targetId) avoidTargetIds.add(decision.targetId)
+          const retryOutcome = decision.targetId
+            ? 'Jev was unsure about this target, so the persona skipped it and asked JEV to reassess the other visible controls.'
+            : 'Jev chose a target action without a reliable target, so the persona asked JEV to reassess the page.'
           history.push({ page: pageLabel(currentState), action: decisionLabel(decision), outcome: retryOutcome })
           timeline.push({
             step,
@@ -266,6 +351,18 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
           timeMs,
           tone: 'danger',
         })
+        emitLiveEvent(input, {
+          kind: 'error',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          detail: primaryProblem,
+          confidence: decision.confidence,
+          latencyMs: decision.latencyMs,
+        })
         break
       }
 
@@ -300,6 +397,18 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
           timeMs,
           tone: 'danger',
         })
+        emitLiveEvent(input, {
+          kind: 'error',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: decisionLabel(decision),
+          detail: actualOutcome,
+          confidence: decision.confidence,
+          latencyMs: decision.latencyMs,
+        })
         break
       }
 
@@ -333,10 +442,24 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
         timeMs,
         tone: actionTone,
       })
+      let actionShot: ScreenshotFrame | null = null
       if (decision.confidence < 0.62 || decision.action.type === 'scroll' || step === 2) {
-        const shot = await capture(activePage, directory, input.id, persona.id, step, currentLabel, selectedText, actionTone === 'danger' ? 'warning' : actionTone === 'success' ? 'success' : 'warning')
-        if (shot) screenshots.push(shot)
+        actionShot = await capture(activePage, directory, input.id, persona.id, step, currentLabel, selectedText, actionTone === 'danger' ? 'warning' : actionTone === 'success' ? 'success' : 'warning', 'action')
+        if (actionShot) screenshots.push(actionShot)
       }
+      emitLiveEvent(input, {
+        kind: 'action',
+        personaId: persona.id,
+        personaName: persona.name,
+        step,
+        page: currentState.url,
+        pageLabel: currentLabel,
+        action: decisionLabel(decision),
+        detail: actualOutcome,
+        confidence: decision.confidence,
+        latencyMs: decision.latencyMs,
+        screenshotSrc: actionShot?.src,
+      })
     }
   } catch (error) {
     primaryProblem = error instanceof Error ? error.message : 'The browser session failed to load.'
@@ -478,7 +601,7 @@ function buildLiveIssues(results: PersonaResult[]): FrictionIssue[] {
   return issues
 }
 
-function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[]): RunReport {
+function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[], liveEvents: LiveEvent[]): RunReport {
   const results = runs.map((run) => run.result)
   const total = results.length
   const completed = results.filter((result) => result.outcome !== 'failed').length
@@ -522,6 +645,7 @@ function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[]): RunRep
     journeyNodes: journey.nodes,
     journeyEdges: journey.edges,
     screenshots,
+    liveEvents,
     bestPath: journey.bestPath,
     guardrailNote: 'Live sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
   }
@@ -529,23 +653,37 @@ function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[]): RunRep
 
 export async function runLiveSimulation(input: LiveSimulationInput): Promise<RunReport> {
   await mkdir(path.join(input.assetDir, input.id), { recursive: true })
-  input.onProgress?.(8, 'Opening isolated browser contexts')
-  const browser = await chromium.launch({ headless: true })
+  const headless = process.env.GHOST_USER_HEADLESS === '1'
+  input.onProgress?.(8, headless ? 'Opening isolated browser contexts' : 'Opening visible Chrome session')
+  const browser = await launchSimulationBrowser(headless)
   const selected = defaultPersonas.slice(0, Math.max(5, Math.min(input.personas, defaultPersonas.length)))
   const runs: PersonaRun[] = []
+  const liveEvents: LiveEvent[] = []
+  const sessionInput: LiveSimulationInput = {
+    ...input,
+    onEvent: (event) => {
+      liveEvents.push(event)
+      input.onEvent?.(event)
+    },
+  }
   try {
-    const concurrency = 3
+    const concurrency = headless ? 3 : 1
     for (let start = 0; start < selected.length; start += concurrency) {
       if (input.signal?.aborted) throw new Error('Run cancelled.')
       const batch = selected.slice(start, start + concurrency)
       const batchResults = await Promise.all(batch.map((persona, offset) =>
-        simulatePersona(browser, input, persona, start + offset, path.join(input.assetDir, input.id)),
+        simulatePersona(browser, sessionInput, persona, start + offset, path.join(input.assetDir, input.id)),
       ))
       runs.push(...batchResults)
       input.onProgress?.(15 + Math.round(runs.length / selected.length * 72), 'Running live browser sessions · ' + runs.length + '/' + selected.length)
     }
     input.onProgress?.(93, 'Clustering live friction')
-    return buildLiveReport(input, runs)
+    const report = buildLiveReport(input, runs, liveEvents)
+    if (!headless) {
+      const closeDelayMs = Number(process.env.GHOST_USER_VISIBLE_CLOSE_DELAY_MS || 6000)
+      await new Promise((resolve) => setTimeout(resolve, Math.max(1000, Math.min(closeDelayMs, 30000))))
+    }
+    return report
   } finally {
     await browser.close().catch(() => undefined)
   }

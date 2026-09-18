@@ -6,6 +6,7 @@ export const JEV_MODEL = 'jev-1.13.0'
 const JEV_PRICE_PER_M_INPUT_TOKENS_USD = 0.042
 const targetConfidenceThreshold = 0.45
 const targetProbabilityThreshold = 0.35
+const maxTargetChoices = 240
 const sensitivePattern = /password|passcode|credit|card number|cvv|cvc|security code|ssn|social security/i
 const protectedControlPattern = /sign\s*up|signup|register|create account|free trial|checkout|place order|buy now|purchase|pay|submit|send message|delete|book (?:a )?(?:demo|appointment)/i
 
@@ -104,6 +105,27 @@ function elementLabel(element: InteractiveElement) {
     .slice(0, 180)
 }
 
+function taskKeywords(task: string) {
+  const ignored = new Set(['the', 'and', 'for', 'with', 'from', 'into', 'that', 'this', 'find', 'page', 'site', 'current', 'read', 'open'])
+  return [...new Set((task.toLowerCase().match(/[a-z0-9]+/g) || []).filter((word) => word.length > 2 && !ignored.has(word)))]
+}
+
+function targetCandidates(state: PageState, task: string, avoided: Set<string>) {
+  const eligible = state.interactiveElements.filter((element) => !avoided.has(element.id))
+  if (eligible.length <= maxTargetChoices) return eligible
+  const keywords = taskKeywords(task)
+  return eligible
+    .map((element, index) => {
+      const label = elementLabel(element).toLowerCase()
+      const keywordScore = keywords.reduce((score, keyword) => score + (label.includes(keyword) ? 5 : 0), 0)
+      const typeScore = element.type === 'button' ? 2 : element.type === 'link' ? 1 : element.type === 'input' || element.type === 'select' ? 1 : 0
+      return { element, index, score: keywordScore + typeScore }
+    })
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, maxTargetChoices)
+    .map(({ element }) => element)
+}
+
 function extractValueCandidates(task: string) {
   const values: string[] = []
   const push = (value: string | undefined) => {
@@ -124,7 +146,7 @@ function extractValueCandidates(task: string) {
 
 function pageSnapshotForJev(input: JevAgentInput, values: string[]) {
   const avoided = new Set(input.avoidTargetIds || [])
-  const elements = input.state.interactiveElements
+  const elements = targetCandidates(input.state, input.task, avoided)
     .map((element) => `${element.id} ${elementLabel(element)}${avoided.has(element.id) ? ' [avoid: last action produced no state change]' : ''}`)
   return {
     goal: input.task,
@@ -150,10 +172,9 @@ function pageSnapshotForJev(input: JevAgentInput, values: string[]) {
   } as unknown as EntryType
 }
 
-function buildQuestions(state: JevAgentInput['state'], values: string[], avoidTargetIds: Set<string>) {
+function buildQuestions(state: JevAgentInput['state'], task: string, values: string[], avoidTargetIds: Set<string>) {
   const targetCriteria: Record<string, EntryType> = {}
-  state.interactiveElements.forEach((element) => {
-    if (avoidTargetIds.has(element.id)) return
+  targetCandidates(state, task, avoidTargetIds).forEach((element) => {
     targetCriteria[element.id] = elementLabel(element)
   })
   targetCriteria.none = 'No visible control is the correct target.'
@@ -258,7 +279,7 @@ function baseDecision(input: JevAgentInput, partial: Partial<JevAgentDecision>):
 export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecision> {
   const values = extractValueCandidates(input.task)
   const avoided = new Set(input.avoidTargetIds || [])
-  const questions = buildQuestions(input.state, values, avoided)
+  const questions = buildQuestions(input.state, input.task, values, avoided)
   const startedAt = performance.now()
   const response = await getClient().systemOne({
     state: pageSnapshotForJev(input, values),
@@ -315,20 +336,6 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
     })
   }
 
-  const selectedElement = targetId ? input.state.interactiveElements.find((element) => element.id === targetId) : undefined
-  if ((actionName === 'click' || actionName === 'type' || actionName === 'select') && (!selectedElement || targetConfidence < targetConfidenceThreshold || targetProbability < targetProbabilityThreshold)) {
-    return baseDecision(input, {
-      actionName,
-      targetId,
-      confidence: Math.min(actionConfidence, targetConfidence),
-      goalComplete,
-      destructive,
-      summary: 'Jev did not have enough confidence in a visible target to act autonomously.',
-      expectedOutcome: 'Expose clearer labels or provide a more specific task.',
-      ...metadata,
-    })
-  }
-
   if (destructive >= 0.5 && ['click', 'type', 'select', 'press_enter'].includes(actionName)) {
     return baseDecision(input, {
       kind: 'protected',
@@ -344,6 +351,8 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
     })
   }
 
+  const selectedElement = targetId ? input.state.interactiveElements.find((element) => element.id === targetId) : undefined
+
   if (selectedElement && (actionName === 'type' || actionName === 'select') && sensitivePattern.test(elementLabel(selectedElement))) {
     return baseDecision(input, {
       kind: 'protected',
@@ -355,6 +364,36 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
       summary: 'Jev selected a sensitive field, so the agent stopped before entering data.',
       expectedOutcome: 'Stop without populating a sensitive input.',
       actualOutcome: 'Sensitive input was not populated.',
+      ...metadata,
+    })
+  }
+
+  const targetAction = actionName === 'click' || actionName === 'type' || actionName === 'select'
+  if (targetAction && !selectedElement) {
+    return baseDecision(input, {
+      actionName,
+      targetId,
+      confidence: Math.min(actionConfidence, targetConfidence),
+      goalComplete,
+      destructive,
+      summary: 'Jev chose a target action but did not identify a reliable visible target.',
+      expectedOutcome: 'Reassess the page and choose a visible target or a different safe action.',
+      ...metadata,
+    })
+  }
+
+  // A low-confidence click is still useful UX evidence when JEV selected an
+  // actual, non-protected control. Real users explore; only typing/selecting
+  // needs the stricter confidence gate because it can change submitted data.
+  if (targetAction && actionName !== 'click' && (targetConfidence < targetConfidenceThreshold || targetProbability < targetProbabilityThreshold)) {
+    return baseDecision(input, {
+      actionName,
+      targetId,
+      confidence: Math.min(actionConfidence, targetConfidence),
+      goalComplete,
+      destructive,
+      summary: 'Jev did not have enough confidence in a visible input target to act autonomously.',
+      expectedOutcome: 'Expose a clearer field or provide a more specific task.',
       ...metadata,
     })
   }

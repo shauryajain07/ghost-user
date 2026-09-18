@@ -52,6 +52,12 @@ const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
     onProgress: (progress, phase) => {
       if (controllers.has(run.id)) setRunState(run, 'running', progress, phase)
     },
+    onEvent: (event) => {
+      if (!controllers.has(run.id)) return
+      run.liveEvents = [...(run.liveEvents || []), event].slice(-240)
+      run.phase = event.personaName + ' · ' + event.action
+      runs.set(run.id, run)
+    },
   }).then((finished) => {
     if (!controllers.has(run.id)) return
     controllers.delete(run.id)
@@ -64,6 +70,7 @@ const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
     fallback.phase = 'Preview fallback'
     fallback.errorMessage = error instanceof Error ? error.message : 'The live browser run could not complete.'
     fallback.guardrailNote = 'The live browser run could not complete, so this report is a clearly labeled preview. No external action was submitted.'
+    fallback.liveEvents = run.liveEvents || []
     runs.set(run.id, fallback)
   })
 }
@@ -122,6 +129,7 @@ app.post('/api/runs', (req, res) => {
       journeyNodes: [],
       journeyEdges: [],
       screenshots: [],
+      liveEvents: [],
       bestPath: [],
       guardrailNote: 'JEV-driven sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
     }

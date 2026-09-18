@@ -26,3 +26,5 @@ npm run dev starts the Vite client and the Express API together. The API listens
 The browser-facing contracts keep JEV reasoning separate from execution: JEV receives only a compact structured snapshot, chooses one typed action, Ghost User validates the action, and Playwright executes it. Live runs use isolated Playwright contexts with click, type, select, scroll, back, forward, reload, Enter, wait, and tab actions. Sensitive inputs and destructive boundaries are blocked in code even if the model suggests them. The sample-report button remains fixture-backed so it works without opening an external site.
 
 The microphone is intentionally not part of this integration. The task text in the Ghost User form is the agent instruction, while the JEV model performs the same typed perception-and-action decision loop from the referenced voice-browser project.
+
+Live runs open a visible Google Chrome window by default and mirror decisions, browser actions, and the latest viewport frame in the run modal. Personas run sequentially in visible mode so the browser stays followable. Set `GHOST_USER_HEADLESS=1` in `.env` when you need a background run instead.

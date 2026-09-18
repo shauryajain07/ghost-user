@@ -36,7 +36,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import type { FrictionIssue, PersonaResult, RunReport, RunStatus, ScreenshotFrame } from '../server/types'
+import type { FrictionIssue, LiveEvent, PersonaResult, RunReport, RunStatus, ScreenshotFrame } from '../server/types'
 
 type View = 'new' | 'report' | 'reports'
 type ReportTab = 'overview' | 'journeys' | 'friction' | 'personas'
@@ -461,6 +461,12 @@ function PromiseRow({ icon, title, text }: { icon: ReactNode; title: string; tex
 }
 
 function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => void }) {
+  const events = run.liveEvents || []
+  const recentEvents = [...events].reverse().slice(0, 14)
+  const latestEvent = events[events.length - 1]
+  const latestScreenshot = [...events].reverse().find((event) => event.screenshotSrc)
+  const personaStates = [...new Map(events.filter((event) => event.personaId).map((event) => [event.personaId, event])).values()]
+
   return (
     <div className="modal-scrim">
       <div className="progress-modal panel">
@@ -468,7 +474,7 @@ function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => v
         <div className="progress-orb"><div className="orb-core"><Ghost size={26} /></div><div className="orb-ring ring-one" /><div className="orb-ring ring-two" /></div>
         <span className="card-kicker">{run.personasCount} AI USERS ARE EXPLORING</span>
         <h2>Watching them find their way.</h2>
-        <p className="progress-copy">Each persona is navigating in an isolated session. They can click, type, scroll, change their mind, and stop when the path no longer makes sense.</p>
+        <p className="progress-copy">A headed Chrome session is taking the same actions shown below. Each persona has an isolated session and can click, type, scroll, change their mind, and stop when the path no longer makes sense.</p>
         <div className="progress-status-row"><span><span className="status-pulse" /> {run.phase}</span><strong>{run.progress}%</strong></div>
         <div className="progress-track"><div className="progress-fill" style={{ width: run.progress + '%' }} /></div>
         <div className="progress-steps">
@@ -477,8 +483,53 @@ function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => v
           <ProgressStep label="Cluster friction" done={run.progress > 91} active={run.progress > 75 && run.progress <= 91} />
           <ProgressStep label="Write report" done={false} active={run.progress > 91} />
         </div>
+        <div className="live-console">
+          <div className="live-console-card live-feed-card">
+            <div className="live-console-head"><span><Activity size={13} /> LIVE ACTION FEED</span><small>{events.length} signals</small></div>
+            <div className="live-event-list">
+              {recentEvents.length ? recentEvents.map((event) => <LiveEventRow key={event.id} event={event} />) : <div className="live-empty"><Loader2 size={15} className="spin" /> Waiting for the first JEV decision…</div>}
+            </div>
+          </div>
+          <div className="live-preview-column">
+            <div className="live-console-card live-preview-card">
+              <div className="live-console-head"><span><Eye size={13} /> LIVE BROWSER FRAME</span><small>{latestEvent?.pageLabel || 'Connecting'}</small></div>
+              {latestScreenshot?.screenshotSrc ? <img className="live-preview-image" src={latestScreenshot.screenshotSrc} alt="Latest browser frame from the live persona session" /> : <div className="live-preview-empty"><Globe2 size={22} /><span>Waiting for the browser frame</span></div>}
+              <div className="live-preview-meta"><strong>{latestEvent?.personaName || 'Preparing personas'}</strong><span>{latestEvent ? latestEvent.action : 'Opening Chrome…'}</span></div>
+            </div>
+            <div className="live-console-card live-persona-card">
+              <div className="live-console-head"><span><Users size={13} /> PERSONAS IN PROGRESS</span><small>{personaStates.length}/{run.personasCount}</small></div>
+              <div className="live-persona-list">
+                {personaStates.length ? personaStates.slice(0, 6).map((event) => <div className="live-persona-row" key={event.personaId}><span className={'live-persona-dot ' + liveEventTone(event)} /><span>{event.personaName}</span><small>step {event.step}</small></div>) : <div className="live-persona-placeholder">Sessions will appear as Chrome opens.</div>}
+              </div>
+            </div>
+          </div>
+        </div>
         <button className="cancel-button" onClick={onCancel}>Stop simulation</button>
       </div>
+    </div>
+  )
+}
+
+function liveEventTone(event: LiveEvent) {
+  if (event.kind === 'error') return 'danger'
+  if (event.kind === 'protected' || event.kind === 'finish') return 'success'
+  if (event.confidence < 0.55) return 'warning'
+  return 'neutral'
+}
+
+function LiveEventRow({ event }: { event: LiveEvent }) {
+  const tone = liveEventTone(event)
+  const kindLabel = event.kind === 'decision' ? 'JEV' : event.kind === 'action' ? 'BROWSER' : event.kind.toUpperCase()
+  return (
+    <div className={'live-event-row ' + tone}>
+      <span className="live-event-marker" />
+      <div className="live-event-body">
+        <div className="live-event-topline"><strong>{event.personaName}</strong><span>STEP {event.step}</span><em>{kindLabel}</em></div>
+        <div className="live-event-action">{event.action}</div>
+        <div className="live-event-detail">{event.detail}</div>
+        <div className="live-event-meta"><span>{event.pageLabel}</span><span>{Math.round(event.confidence * 100)}% confidence</span>{event.latencyMs != null && <span>{event.latencyMs}ms</span>}</div>
+      </div>
+      {event.screenshotSrc && <img className="live-event-image" src={event.screenshotSrc} alt="Browser frame" />}
     </div>
   )
 }
@@ -664,7 +715,7 @@ function JourneysTab({ report }: { report: RunReport }) {
 function ScreenshotTimeline({ screenshots }: { screenshots: ScreenshotFrame[] }) {
   const [selected, setSelected] = useState(0)
   const frame = screenshots[selected]
-  return <section className="section-block screenshot-section"><div className="section-heading-row"><div><span className="card-kicker">SCREENSHOT TIMELINE</span><h2>See the moment they hesitated.</h2><p>Each frame is captured from a user session, with their selected element called out.</p></div><span className="capture-label"><span className="live-dot" /> {frame.src ? 'Live capture' : 'Preview capture'}</span></div><div className="screenshot-layout"><div className="browser-preview"><div className="browser-top"><span /><span /><span /><small>{frame.page.toLowerCase()}.acmecloud.dev</small></div><div className="browser-page">{frame.src && <img className="actual-screenshot" src={frame.src} alt={frame.caption} />}<div className="preview-nav"><span className="preview-logo">acme</span><span>Product</span><span className={frame.page === 'Pricing' ? 'preview-selected' : ''}>Pricing</span><span>Resources</span><button>Get started</button></div><div className="preview-body"><div className="preview-title-line" /><div className="preview-title-line short" /><div className="preview-copy-lines"><span /><span /><span /></div><div className="preview-cards"><div className={frame.selected === 'Starter' ? 'preview-card selected' : 'preview-card'}><span className="preview-card-title">Starter</span><strong>$19</strong><span className="preview-card-line" /><span className="preview-card-line short" /><button>Start free trial</button></div><div className="preview-card"><span className="preview-card-title">Pro</span><strong>$49</strong><span className="preview-card-line" /><span className="preview-card-line short" /><button>Compare plan</button></div><div className="preview-card faded"><span className="preview-card-title">Scale</span><strong>$99</strong><span className="preview-card-line" /><span className="preview-card-line short" /></div></div></div>{frame.selected && <div className={'selection-callout ' + frame.tone}><span className="callout-line" /><span><Eye size={12} /> Selected: {frame.selected}</span></div>}</div></div><div className="screenshot-steps">{screenshots.map((item, index) => <button key={item.step} className={'screenshot-step ' + (selected === index ? 'selected' : '')} onClick={() => setSelected(index)}><span className="step-number">{String(item.step).padStart(2, '0')}</span><span><strong>{item.page}</strong><small>{item.caption}</small></span><span className={'step-state ' + item.tone}>{item.tone === 'success' ? <Check size={13} /> : <TriangleAlert size={13} />}</span></button>)}</div></div></section>
+  return <section className="section-block screenshot-section"><div className="section-heading-row"><div><span className="card-kicker">SCREENSHOT TIMELINE</span><h2>See the moment they hesitated.</h2><p>Each frame is captured from a user session, with their selected element called out.</p></div><span className="capture-label"><span className="live-dot" /> {frame.src ? 'Live capture' : 'Preview capture'}</span></div><div className="screenshot-layout"><div className="browser-preview"><div className="browser-top"><span /><span /><span /><small>{frame.page.toLowerCase()}.acmecloud.dev</small></div><div className="browser-page">{frame.src && <img className="actual-screenshot" src={frame.src} alt={frame.caption} />}<div className="preview-nav"><span className="preview-logo">acme</span><span>Product</span><span className={frame.page === 'Pricing' ? 'preview-selected' : ''}>Pricing</span><span>Resources</span><button>Get started</button></div><div className="preview-body"><div className="preview-title-line" /><div className="preview-title-line short" /><div className="preview-copy-lines"><span /><span /><span /></div><div className="preview-cards"><div className={frame.selected === 'Starter' ? 'preview-card selected' : 'preview-card'}><span className="preview-card-title">Starter</span><strong>$19</strong><span className="preview-card-line" /><span className="preview-card-line short" /><button>Start free trial</button></div><div className="preview-card"><span className="preview-card-title">Pro</span><strong>$49</strong><span className="preview-card-line" /><span className="preview-card-line short" /><button>Compare plan</button></div><div className="preview-card faded"><span className="preview-card-title">Scale</span><strong>$99</strong><span className="preview-card-line" /><span className="preview-card-line short" /></div></div></div>{frame.selected && <div className={'selection-callout ' + frame.tone}><span className="callout-line" /><span><Eye size={12} /> Selected: {frame.selected}</span></div>}</div></div><div className="screenshot-steps">{screenshots.map((item, index) => <button key={item.src || item.step + '-' + index} className={'screenshot-step ' + (selected === index ? 'selected' : '')} onClick={() => setSelected(index)}><span className="step-number">{String(item.step).padStart(2, '0')}</span><span><strong>{item.page}</strong><small>{item.caption}</small></span><span className={'step-state ' + item.tone}>{item.tone === 'success' ? <Check size={13} /> : <TriangleAlert size={13} />}</span></button>)}</div></div></section>
 }
 
 function FrictionTab({ report }: { report: RunReport }) {
