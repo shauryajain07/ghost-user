@@ -109,6 +109,24 @@ export interface ScreenshotFrame {
   src?: string
 }
 
+export type LiveEventKind = 'observation' | 'decision' | 'action' | 'finish' | 'protected' | 'error'
+
+export interface LiveEvent {
+  id: string
+  at: string
+  kind: LiveEventKind
+  personaId: string
+  personaName: string
+  step: number
+  page: string
+  pageLabel: string
+  action: string
+  detail: string
+  confidence: number
+  latencyMs?: number
+  screenshotSrc?: string
+}
+
 export interface RunMetrics {
   completed: number
   total: number
@@ -144,6 +162,7 @@ export interface RunReport {
   journeyNodes: JourneyNode[]
   journeyEdges: JourneyEdge[]
   screenshots: ScreenshotFrame[]
+  liveEvents?: LiveEvent[]
   bestPath: string[]
   guardrailNote: string
   errorMessage?: string
