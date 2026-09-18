@@ -1,5 +1,7 @@
 import { APIUserAbortError, TypeSafeClient, choice, noul, score, type EntryType, type Question } from '@typesafe-ai/sdk'
-import type { BrowserAction, InteractiveElement, PageState, Persona } from '../types'
+import { isProtectedControl, isSensitiveElement } from './browser'
+import { behaviorSummary, recoveryInstruction, visibleTextLimit, type PersonaRuntimeSignals } from './persona-policy'
+import type { ActionPolicy, BrowserAction, InteractiveElement, PageState, Persona } from '../types'
 
 export const JEV_MODEL = 'jev-1.13.0'
 
@@ -7,9 +9,6 @@ const JEV_PRICE_PER_M_INPUT_TOKENS_USD = 0.042
 const targetConfidenceThreshold = 0.45
 const targetProbabilityThreshold = 0.35
 const maxTargetChoices = 240
-const sensitivePattern = /password|passcode|credit|card number|cvv|cvc|security code|ssn|social security/i
-const protectedControlPattern = /sign\s*up|signup|register|create account|free trial|checkout|place order|buy now|purchase|pay|submit|send message|delete|book (?:a )?(?:demo|appointment)/i
-
 const ACTION_CRITERIA = {
   click: {
     what: 'Click a visible link, button, tab, result, topic, card, or other page control that advances the task.',
@@ -52,11 +51,13 @@ export interface JevAgentInput {
   avoidTargetIds?: string[]
   step: number
   maxSteps: number
+  actionPolicy?: ActionPolicy
+  runtimeSignals?: PersonaRuntimeSignals
   signal?: AbortSignal
 }
 
 export interface JevAgentDecision {
-  kind: 'action' | 'finish' | 'wait' | 'protected'
+  kind: 'action' | 'finish' | 'wait' | 'protected' | 'abandon'
   action?: BrowserAction
   actionName: string
   targetId?: string
@@ -110,19 +111,31 @@ function taskKeywords(task: string) {
   return [...new Set((task.toLowerCase().match(/[a-z0-9]+/g) || []).filter((word) => word.length > 2 && !ignored.has(word)))]
 }
 
-function targetCandidates(state: PageState, task: string, avoided: Set<string>) {
+function targetCandidates(state: PageState, task: string, avoided: Set<string>, persona?: Persona) {
   const eligible = state.interactiveElements.filter((element) => !avoided.has(element.id))
-  if (eligible.length <= maxTargetChoices) return eligible
+  if (!persona && eligible.length <= maxTargetChoices) return eligible
   const keywords = taskKeywords(task)
+  const targetLimit = !persona
+    ? maxTargetChoices
+    : persona.attentionToDetail < 0.3
+      ? 12
+      : persona.behavior.scanDepth === 'shallow'
+        ? 24
+        : persona.behavior.scanDepth === 'balanced'
+          ? 80
+          : maxTargetChoices
   return eligible
     .map((element, index) => {
       const label = elementLabel(element).toLowerCase()
       const keywordScore = keywords.reduce((score, keyword) => score + (label.includes(keyword) ? 5 : 0), 0)
       const typeScore = element.type === 'button' ? 2 : element.type === 'link' ? 1 : element.type === 'input' || element.type === 'select' ? 1 : 0
-      return { element, index, score: keywordScore + typeScore }
+      const priceBoost = persona && /price|pricing|plan|cost|billing|discount|free/i.test(label) ? persona.priceSensitivity * 4 : 0
+      const technicalBoost = persona && /docs?|documentation|api|sdk|reference|auth|security/i.test(label) ? persona.technicalLiteracy * 4 : 0
+      const ctaBoost = persona && /get started|start|try|learn more|explore/i.test(label) ? persona.behavior.ctaBias * 4 : 0
+      return { element, index, score: keywordScore + typeScore + priceBoost + technicalBoost + ctaBoost }
     })
     .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, maxTargetChoices)
+    .slice(0, targetLimit)
     .map(({ element }) => element)
 }
 
@@ -144,10 +157,11 @@ function extractValueCandidates(task: string) {
   return values.slice(0, 8)
 }
 
-function pageSnapshotForJev(input: JevAgentInput, values: string[]) {
+export function pageSnapshotForJev(input: JevAgentInput, values: string[]) {
   const avoided = new Set(input.avoidTargetIds || [])
-  const elements = targetCandidates(input.state, input.task, avoided)
+  const elements = targetCandidates(input.state, input.task, avoided, input.persona)
     .map((element) => `${element.id} ${elementLabel(element)}${avoided.has(element.id) ? ' [avoid: last action produced no state change]' : ''}`)
+  const runtimeSignals = input.runtimeSignals || { exploratoryActions: 0, comparisonActions: 0, noProgressEvents: 0, recoveryAttempts: 0 }
   return {
     goal: input.task,
     persona: {
@@ -155,26 +169,40 @@ function pageSnapshotForJev(input: JevAgentInput, values: string[]) {
       description: input.persona.description,
       patience: input.persona.patience,
       technical_literacy: input.persona.technicalLiteracy,
+      risk_tolerance: input.persona.riskTolerance,
       attention_to_detail: input.persona.attentionToDetail,
       willingness_to_explore: input.persona.willingnessToExplore,
       price_sensitivity: input.persona.priceSensitivity,
+      behavior_profile: input.persona.behavior,
+      behavior_summary: behaviorSummary(input.persona),
     },
+    action_policy: input.actionPolicy || 'safe',
     page: {
       url: input.state.url.slice(0, 240),
       title: input.state.title.slice(0, 160),
-      visible_text: input.state.visibleText.slice(0, 6000),
+      visible_text: input.state.visibleText.slice(0, visibleTextLimit(input.persona.behavior.scanDepth)),
     },
     elements,
     value_candidates: values,
     recent_actions: input.history.slice(-8),
     avoid_targets: input.avoidTargetIds || [],
+    runtime_signals: runtimeSignals,
+    recovery_instruction: recoveryInstruction(input.persona, runtimeSignals),
     progress: `Step ${input.step} of ${input.maxSteps}`,
   } as unknown as EntryType
 }
 
-function buildQuestions(state: JevAgentInput['state'], task: string, values: string[], avoidTargetIds: Set<string>) {
+function buildQuestions(
+  state: JevAgentInput['state'],
+  task: string,
+  values: string[],
+  avoidTargetIds: Set<string>,
+  persona: Persona,
+  actionPolicy: ActionPolicy,
+  runtimeSignals: PersonaRuntimeSignals,
+) {
   const targetCriteria: Record<string, EntryType> = {}
-  targetCandidates(state, task, avoidTargetIds).forEach((element) => {
+  targetCandidates(state, task, avoidTargetIds, persona).forEach((element) => {
     targetCriteria[element.id] = elementLabel(element)
   })
   targetCriteria.none = 'No visible control is the correct target.'
@@ -183,7 +211,7 @@ function buildQuestions(state: JevAgentInput['state'], task: string, values: str
     action: choice(
       {
         question: 'Which single safe browser action should the persona take next to make progress on `goal`?',
-        focus: 'Use the current page, visible text, element labels, persona traits, recent_actions, and progress. Choose finish only when the goal is visibly complete or the next step would cross a protected boundary. Never invent a target or value.',
+        focus: `Use the current page, visible text, element labels, persona traits, behavior profile, recent_actions, runtime signals, and progress. ${behaviorSummary(persona)}. ${recoveryInstruction(persona, runtimeSignals)} Choose finish only when the goal is visibly complete or the next step would cross a protected boundary. Never invent a target or value. Action policy is ${actionPolicy}; protected actions may only be executed when policy is full.`,
       },
       ACTION_CRITERIA,
     ),
@@ -207,7 +235,9 @@ function buildQuestions(state: JevAgentInput['state'], task: string, values: str
     protected_boundary: noul(
       {
         question: 'Has the persona reached a protected account, payment, message, destructive, or sensitive-input boundary where Ghost User must stop before acting?',
-        focus: 'This is a safety classification for the current page, not a task-success classification.',
+        focus: actionPolicy === 'safe'
+          ? 'This is a safety classification for the current page, not a task-success classification. Safe policy requires stopping before the boundary.'
+          : 'This is still a safety classification, but the explicitly confirmed full action policy permits continuing. Use only values supplied verbatim in the task and never invent credentials or payment data.',
       },
       {
         true: 'Stop safely and report a protected boundary.',
@@ -279,7 +309,9 @@ function baseDecision(input: JevAgentInput, partial: Partial<JevAgentDecision>):
 export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecision> {
   const values = extractValueCandidates(input.task)
   const avoided = new Set(input.avoidTargetIds || [])
-  const questions = buildQuestions(input.state, input.task, values, avoided)
+  const actionPolicy = input.actionPolicy || 'safe'
+  const runtimeSignals = input.runtimeSignals || { exploratoryActions: 0, comparisonActions: 0, noProgressEvents: 0, recoveryAttempts: 0 }
+  const questions = buildQuestions(input.state, input.task, values, avoided, input.persona, actionPolicy, runtimeSignals)
   const startedAt = performance.now()
   const response = await getClient().systemOne({
     state: pageSnapshotForJev(input, values),
@@ -309,7 +341,7 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
     requestId: response.requestId,
   }
 
-  if (protectedBoundary >= 0.72) {
+  if (actionPolicy === 'safe' && protectedBoundary >= 0.72) {
     return baseDecision(input, {
       kind: 'protected',
       actionName,
@@ -336,7 +368,7 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
     })
   }
 
-  if (destructive >= 0.5 && ['click', 'type', 'select', 'press_enter'].includes(actionName)) {
+  if (actionPolicy === 'safe' && destructive >= 0.5 && ['click', 'type', 'select', 'press_enter'].includes(actionName)) {
     return baseDecision(input, {
       kind: 'protected',
       actionName,
@@ -353,7 +385,7 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
 
   const selectedElement = targetId ? input.state.interactiveElements.find((element) => element.id === targetId) : undefined
 
-  if (selectedElement && (actionName === 'type' || actionName === 'select') && sensitivePattern.test(elementLabel(selectedElement))) {
+  if (actionPolicy === 'safe' && selectedElement && (actionName === 'type' || actionName === 'select') && isSensitiveElement(selectedElement)) {
     return baseDecision(input, {
       kind: 'protected',
       actionName,
@@ -398,7 +430,7 @@ export async function decideWithJev(input: JevAgentInput): Promise<JevAgentDecis
     })
   }
 
-  if (selectedElement && actionName === 'click' && protectedControlPattern.test(elementLabel(selectedElement))) {
+  if (actionPolicy === 'safe' && selectedElement && actionName === 'click' && isProtectedControl(selectedElement)) {
     return baseDecision(input, {
       kind: 'protected',
       actionName,

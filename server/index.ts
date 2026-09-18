@@ -5,6 +5,8 @@ import express from 'express'
 import { buildDemoReport, personas as simulationPersonas } from './simulation/fixtures'
 import { runLiveSimulation } from './simulation/live'
 import { hasJevApiKey, JEV_MODEL } from './simulation/jev-agent'
+import { validateActionPolicy } from './simulation/action-policy'
+import { createRunSeed, deviceLabel } from './simulation/persona-policy'
 import type { CreateRunInput, LiveAgentState, LiveEvent, RunReport, RunStatus } from './types'
 
 const app = express()
@@ -30,7 +32,11 @@ const normalizeInput = (body: Partial<CreateRunInput>): Required<CreateRunInput>
   if (task.length < 8) throw new Error('Add a little more detail to the task so users know what to do.')
   const personas = Math.max(5, Math.min(Number(body.personas) || 15, 15))
   const maxSteps = Math.max(10, Math.min(Number(body.maxSteps) || 30, 50))
-  return { website, task, personas, maxSteps }
+  const actionPolicy = body.actionPolicy === 'full' ? 'full' : 'safe'
+  const confirmProtectedActions = body.confirmProtectedActions === true
+  const policy = validateActionPolicy(website, actionPolicy, confirmProtectedActions)
+  if (!policy.ok) throw new Error(policy.reason)
+  return { website, task, personas, maxSteps, actionPolicy, confirmProtectedActions }
 }
 
 const setRunState = (run: RunReport, status: RunStatus, progress: number, phase: string) => {
@@ -57,6 +63,8 @@ const createLiveAgents = (count: number): LiveAgentState[] => simulationPersonas
   pageLabel: 'Queued',
   action: 'Waiting for an isolated browser session',
   confidence: 0,
+  deviceLabel: deviceLabel(persona.behavior),
+  profileLabels: persona.behavior.labels,
 }))
 
 const updateLiveAgent = (run: RunReport, event: LiveEvent) => {
@@ -76,12 +84,15 @@ const updateLiveAgent = (run: RunReport, event: LiveEvent) => {
 
 const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
   const controller = new AbortController()
+  const variationSeed = run.variationSeed || createRunSeed()
+  run.variationSeed = variationSeed
   controllers.set(run.id, controller)
   setRunState(run, 'running', 5, 'Preparing live personas')
   void runLiveSimulation({
     ...input,
     id: run.id,
     assetDir: assetRoot,
+    variationSeed,
     signal: controller.signal,
     onProgress: (progress, phase) => {
       if (controllers.has(run.id)) setRunState(run, 'running', progress, phase)
@@ -102,6 +113,8 @@ const scheduleRun = (run: RunReport, input: Required<CreateRunInput>) => {
     controllers.delete(run.id)
     const fallback = buildDemoReport({ ...input, id: run.id })
     fallback.executionMode = 'fallback'
+    fallback.actionPolicy = input.actionPolicy
+    fallback.variationSeed = variationSeed
     fallback.phase = 'Preview fallback'
     fallback.errorMessage = error instanceof Error ? error.message : 'The live browser run could not complete.'
     fallback.guardrailNote = 'The live browser run could not complete, so this report is a clearly labeled preview. No external action was submitted.'
@@ -141,6 +154,7 @@ app.post('/api/runs', (req, res) => {
       ...buildDemoReport({ ...input, id }),
       status: 'queued',
       executionMode: 'live',
+      actionPolicy: input.actionPolicy,
       progress: 3,
       phase: 'Queued for simulation',
       createdAt: now,
@@ -167,8 +181,11 @@ app.post('/api/runs', (req, res) => {
       screenshots: [],
       liveEvents: [],
       liveAgents: createLiveAgents(input.personas),
+      protectedActionAudit: [],
       bestPath: [],
-      guardrailNote: 'JEV-driven sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
+      guardrailNote: input.actionPolicy === 'full'
+        ? 'Full action mode is enabled for this explicitly confirmed allowlisted test host. Protected actions will be audit-logged.'
+        : 'JEV-driven sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
     }
     runs.set(id, run)
     scheduleRun(run, input)

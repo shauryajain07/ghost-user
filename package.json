@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"tsx watch server/index.ts\"",
     "build": "tsc --noEmit && vite build",
+    "test": "node --import tsx --test server/simulation/persona-policy.test.ts",
     "start": "tsx server/index.ts",
     "preview": "vite preview"
   },

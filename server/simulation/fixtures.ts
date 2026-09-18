@@ -4,12 +4,31 @@ import type {
   JourneyEdge,
   JourneyNode,
   Persona,
+  PersonaBehaviorProfile,
   PersonaResult,
   RunReport,
   ScreenshotFrame,
 } from '../types'
 
-export const personas: Persona[] = [
+const behaviorProfiles: Record<string, PersonaBehaviorProfile> = {
+  p1: { scanDepth: 'shallow', explorationBudget: 1, comparisonBudget: 0, noProgressLimit: 1, recoveryStyle: 'abandon', ctaBias: 0.85, waitRangeMs: [150, 450], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Fast scan', 'Low patience', 'CTA-first'] },
+  p2: { scanDepth: 'deep', explorationBudget: 5, comparisonBudget: 4, noProgressLimit: 3, recoveryStyle: 'retry', ctaBias: 0.2, waitRangeMs: [800, 1600], device: 'desktop', viewport: { width: 1440, height: 900 }, labels: ['Deep reader', 'Compares plans', 'Patient'] },
+  p3: { scanDepth: 'deep', explorationBudget: 4, comparisonBudget: 3, noProgressLimit: 3, recoveryStyle: 'retry', ctaBias: 0.15, waitRangeMs: [700, 1400], device: 'desktop', viewport: { width: 1440, height: 900 }, labels: ['Technical', 'Evidence-first', 'Deep reader'] },
+  p4: { scanDepth: 'balanced', explorationBudget: 2, comparisonBudget: 1, noProgressLimit: 2, recoveryStyle: 'retry', ctaBias: 0.45, waitRangeMs: [500, 1000], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Low context', 'Familiar labels'] },
+  p5: { scanDepth: 'deep', explorationBudget: 3, comparisonBudget: 3, noProgressLimit: 3, recoveryStyle: 'backtrack', ctaBias: 0.05, waitRangeMs: [650, 1400], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Trust-first', 'Cost-aware', 'Cautious'] },
+  p6: { scanDepth: 'shallow', explorationBudget: 1, comparisonBudget: 1, noProgressLimit: 1, recoveryStyle: 'abandon', ctaBias: 0.7, waitRangeMs: [300, 700], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Task-focused', 'Direct path'] },
+  p7: { scanDepth: 'deep', explorationBudget: 7, comparisonBudget: 2, noProgressLimit: 4, recoveryStyle: 'backtrack', ctaBias: 0.3, waitRangeMs: [650, 1300], device: 'desktop', viewport: { width: 1440, height: 900 }, labels: ['Explores', 'Builds context', 'Patient'] },
+  p8: { scanDepth: 'shallow', explorationBudget: 1, comparisonBudget: 0, noProgressLimit: 1, recoveryStyle: 'abandon', ctaBias: 0.5, waitRangeMs: [250, 650], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Shallow scan', 'Needs signposting'] },
+  p9: { scanDepth: 'deep', explorationBudget: 6, comparisonBudget: 5, noProgressLimit: 4, recoveryStyle: 'backtrack', ctaBias: 0.1, waitRangeMs: [750, 1700], device: 'desktop', viewport: { width: 1440, height: 900 }, labels: ['Compares options', 'Price-sensitive', 'Deep reader'] },
+  p10: { scanDepth: 'shallow', explorationBudget: 2, comparisonBudget: 1, noProgressLimit: 1, recoveryStyle: 'abandon', ctaBias: 0.65, waitRangeMs: [300, 800], device: 'mobile', viewport: { width: 390, height: 844 }, labels: ['Mobile', 'Compact nav', 'Fast scan'] },
+  p11: { scanDepth: 'deep', explorationBudget: 4, comparisonBudget: 3, noProgressLimit: 3, recoveryStyle: 'retry', ctaBias: 0.25, waitRangeMs: [650, 1300], device: 'desktop', viewport: { width: 1440, height: 900 }, labels: ['Team evidence', 'Deep reader'] },
+  p12: { scanDepth: 'balanced', explorationBudget: 2, comparisonBudget: 1, noProgressLimit: 2, recoveryStyle: 'retry', ctaBias: 0.35, waitRangeMs: [500, 1050], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Plain language', 'Needs reassurance'] },
+  p13: { scanDepth: 'shallow', explorationBudget: 1, comparisonBudget: 0, noProgressLimit: 2, recoveryStyle: 'retry', ctaBias: 0.7, waitRangeMs: [350, 850], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Familiar patterns', 'Shortcut'] },
+  p14: { scanDepth: 'deep', explorationBudget: 5, comparisonBudget: 3, noProgressLimit: 4, recoveryStyle: 'backtrack', ctaBias: 0.05, waitRangeMs: [900, 1800], device: 'desktop', viewport: { width: 1440, height: 900 }, labels: ['Security-first', 'Edge-case checker', 'Cautious'] },
+  p15: { scanDepth: 'shallow', explorationBudget: 1, comparisonBudget: 0, noProgressLimit: 1, recoveryStyle: 'abandon', ctaBias: 0.8, waitRangeMs: [200, 550], device: 'desktop', viewport: { width: 1280, height: 820 }, labels: ['Shortcut', 'CTA-first', 'Low patience'] },
+}
+
+const personaDefinitions: Omit<Persona, 'behavior'>[] = [
   {
     id: 'p1',
     name: 'Impatient User',
@@ -207,6 +226,11 @@ export const personas: Persona[] = [
   },
 ]
 
+export const personas: Persona[] = personaDefinitions.map((persona) => ({
+  ...persona,
+  behavior: behaviorProfiles[persona.id],
+}))
+
 const makeTimeline = (items: Array<Omit<AgentStep, 'step'>>): AgentStep[] =>
   items.map((item, index) => ({ ...item, step: index + 1 }))
 
@@ -366,6 +390,16 @@ const makePersonaResults = (): PersonaResult[] => {
             : isLowConfidence
               ? 'Plan differentiation was just clear enough, but required extra comparison.'
               : 'No meaningful friction detected on the successful path.',
+      variationSeed: 0,
+      behaviorStats: {
+        exploratoryActions: outcome === 'failed' ? 2 : persona.behavior.explorationBudget > 3 ? 2 : 1,
+        recoveryAttempts: outcome === 'failed' ? 2 : persona.behavior.recoveryStyle === 'backtrack' ? 1 : 0,
+        noProgressEvents: outcome === 'failed' ? 1 : isLowConfidence ? 1 : 0,
+        uniquePages: new Set(path).size,
+        comparisonActions: persona.behavior.comparisonBudget > 2 ? 2 : 1,
+        protectedActionsAttempted: outcome === 'protected' ? 1 : 0,
+      },
+      protectedActionAudit: [],
       confidenceDrop: outcome === 'failed' ? 'Step 3 · 64% → 31%' : isLowConfidence ? 'Step 3 · 82% → 43%' : undefined,
       timeline,
     }
@@ -446,7 +480,7 @@ const screenshots: ScreenshotFrame[] = [
   { step: 4, page: 'Signup', caption: 'Safe stopping point before account details', selected: 'Starter plan', tone: 'success' },
 ]
 
-export function buildDemoReport(input: { website: string; task: string; personas?: number; maxSteps?: number; id?: string }): RunReport {
+export function buildDemoReport(input: { website: string; task: string; personas?: number; maxSteps?: number; id?: string; actionPolicy?: 'safe' | 'full' }): RunReport {
   const url = new URL(input.website)
   const personaResults = makePersonaResults().slice(0, Math.max(5, Math.min(input.personas ?? 15, 15)))
   const total = personaResults.length
@@ -455,6 +489,7 @@ export function buildDemoReport(input: { website: string; task: string; personas
     id: input.id ?? 'demo-run',
     status: 'complete',
     executionMode: 'preview',
+    actionPolicy: input.actionPolicy || 'safe',
     progress: 100,
     phase: 'Report ready',
     website: input.website,
@@ -484,6 +519,7 @@ export function buildDemoReport(input: { website: string; task: string; personas
     journeyNodes,
     journeyEdges,
     screenshots,
+    protectedActionAudit: [],
     bestPath: ['Homepage', 'Pricing', 'Starter plan', 'Signup boundary'],
     guardrailNote: 'Simulations stop at protected action boundaries. No account, payment, message, or destructive action is submitted.',
   }

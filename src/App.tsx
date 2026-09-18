@@ -36,7 +36,7 @@ import {
   X,
   Zap,
 } from 'lucide-react'
-import type { FrictionIssue, LiveAgentState, LiveEvent, PersonaResult, RunReport, RunStatus, ScreenshotFrame } from '../server/types'
+import type { ActionPolicy, FrictionIssue, LiveAgentState, LiveEvent, PersonaResult, RunReport, RunStatus, ScreenshotFrame } from '../server/types'
 
 type View = 'new' | 'report' | 'reports'
 type ReportTab = 'overview' | 'journeys' | 'friction' | 'personas'
@@ -92,6 +92,8 @@ function App() {
     website: 'https://acmecloud.dev',
     task: 'Find the cheapest paid plan and start signing up for it.',
     personas: 15,
+    actionPolicy: 'safe' as ActionPolicy,
+    confirmProtectedActions: false,
   })
 
   useEffect(() => {
@@ -135,6 +137,10 @@ function App() {
   const startRun = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setFormError('')
+    if (form.actionPolicy === 'full' && !form.confirmProtectedActions) {
+      setFormError('Confirm full action mode before starting a run.')
+      return
+    }
     try {
       const response = await fetch('/api/runs', {
         method: 'POST',
@@ -322,9 +328,9 @@ function NewTestPage({
   onViewDemo,
   loadingDemo,
 }: {
-  form: { website: string; task: string; personas: number }
+  form: { website: string; task: string; personas: number; actionPolicy: ActionPolicy; confirmProtectedActions: boolean }
   error: string
-  onChange: (form: { website: string; task: string; personas: number }) => void
+  onChange: (form: { website: string; task: string; personas: number; actionPolicy: ActionPolicy; confirmProtectedActions: boolean }) => void
   onSubmit: (event: FormEvent<HTMLFormElement>) => void
   onViewDemo: () => void
   loadingDemo: boolean
@@ -403,9 +409,21 @@ function NewTestPage({
               <div className="limit-value"><Clock3 size={14} /> 30 steps <ChevronDown size={14} /></div>
             </div>
           </div>
+          <div className="action-policy-block">
+            <span className="field-label">Action policy <span>Safe by default</span></span>
+            <div className="action-policy-options">
+              <button type="button" className={form.actionPolicy === 'safe' ? 'policy-option selected' : 'policy-option'} onClick={() => onChange({ ...form, actionPolicy: 'safe', confirmProtectedActions: false })}>
+                <ShieldCheck size={14} /><span><strong>Safe mode</strong><small>Stops before protected actions</small></span>
+              </button>
+              <button type="button" className={form.actionPolicy === 'full' ? 'policy-option selected full' : 'policy-option'} onClick={() => onChange({ ...form, actionPolicy: 'full' })}>
+                <Zap size={14} /><span><strong>Full actions</strong><small>For confirmed allowlisted test hosts</small></span>
+              </button>
+            </div>
+            {form.actionPolicy === 'full' && <label className="policy-confirmation"><input type="checkbox" checked={form.confirmProtectedActions} onChange={(event) => onChange({ ...form, confirmProtectedActions: event.target.checked })} /> I understand this run may submit external actions.</label>}
+          </div>
           {error && <div className="form-error"><TriangleAlert size={16} /> {error}</div>}
           <div className="form-submit-row">
-            <span className="form-footnote"><ShieldCheck size={14} /> Stops before signup, payment, or destructive actions.</span>
+            <span className={'form-footnote ' + (form.actionPolicy === 'full' ? 'full-policy-note' : '')}>{form.actionPolicy === 'full' ? <><Zap size={14} /> Full action mode is explicitly enabled.</> : <><ShieldCheck size={14} /> Stops before signup, payment, or destructive actions.</>}</span>
             <button className="run-button" type="submit"><Play size={16} fill="currentColor" /> Run user test <ArrowRight size={16} /></button>
           </div>
         </form>
@@ -468,11 +486,11 @@ function RunProgressModal({ run, onCancel }: { run: RunReport; onCancel: () => v
   return (
     <div className="modal-scrim">
       <div className="progress-modal panel">
-        <div className="progress-modal-top"><div className="modal-live"><span className="live-dot" /> LIVE JEV SIMULATION</div><button className="icon-button" onClick={onCancel} aria-label="Cancel run"><X size={18} /></button></div>
+        <div className="progress-modal-top"><div className="modal-live"><span className="live-dot" /> LIVE JEV SIMULATION <span className={run.actionPolicy === 'full' ? 'policy-live-badge full' : 'policy-live-badge'}>{run.actionPolicy === 'full' ? 'FULL ACTIONS' : 'SAFE MODE'}</span></div><button className="icon-button" onClick={onCancel} aria-label="Cancel run"><X size={18} /></button></div>
         <div className="progress-orb"><div className="orb-core"><Ghost size={26} /></div><div className="orb-ring ring-one" /><div className="orb-ring ring-two" /></div>
         <span className="card-kicker">{run.personasCount} AI USERS ARE EXPLORING</span>
         <h2>Watching them find their way.</h2>
-        <p className="progress-copy">Hidden browser sessions are taking the same actions shown below. Watch the latest frame from every persona without opening a Chrome window. Each session is isolated and can click, type, scroll, change its mind, and stop when the path no longer makes sense.</p>
+        <p className="progress-copy">Hidden browser sessions are taking the same actions shown below. Watch the latest frame from every persona without opening a Chrome window. Each session has its own behavior profile, device context, and recovery style.</p>
         <div className="progress-status-row"><span><span className="status-pulse" /> {run.phase}</span><strong>{run.progress}%</strong></div>
         <div className="progress-track"><div className="progress-fill" style={{ width: run.progress + '%' }} /></div>
         <div className="progress-steps">
@@ -550,7 +568,8 @@ function LiveAgentTile({ agent }: { agent: LiveAgentState }) {
       <div className="live-agent-info">
         <div className="live-agent-name"><span className="live-agent-avatar" style={{ background: agent.color }}>{agent.initials}</span><strong>{agent.name}</strong><small>step {agent.step}</small></div>
         <div className="live-agent-action" title={agent.action}>{agent.action}</div>
-        <div className="live-agent-meta"><span>{agent.pageLabel}</span><span>{Math.round(agent.confidence * 100)}%</span></div>
+        {agent.profileLabels?.length ? <div className="live-agent-profile" title={agent.profileLabels.join(' · ')}>{agent.profileLabels.slice(0, 2).join(' · ')}</div> : null}
+        <div className="live-agent-meta"><span>{agent.pageLabel}</span><span>{agent.deviceLabel || 'Profiled device'}</span><span>{Math.round(agent.confidence * 100)}%</span></div>
       </div>
     </article>
   )
@@ -639,7 +658,7 @@ function ReportPage({
           <button className="back-link" onClick={onNewTest}><ArrowLeft size={15} /> New test</button>
           <div className="report-domain-row"><span className="site-favicon large">{report.domain.slice(0, 1).toUpperCase()}</span><span>{report.domain}</span><span className={'report-status ' + report.executionMode}><span className="result-dot ready" /> {reportLabel}</span></div>
           <h1>{report.task}</h1>
-          <div className="report-meta"><span><Globe2 size={14} /> {report.website}</span><span><Clock3 size={14} /> Ran 34 minutes ago</span><span><Users size={14} /> {report.personasCount} personas</span></div>
+          <div className="report-meta"><span><Globe2 size={14} /> {report.website}</span><span><Clock3 size={14} /> Ran 34 minutes ago</span><span><Users size={14} /> {report.personasCount} personas</span><span><ShieldCheck size={14} /> {report.actionPolicy === 'full' ? 'Full actions' : 'Safe mode'}</span></div>
         </div>
         <div className="report-header-actions"><button className="outline-button"><Download size={15} /> Export report</button><button className="icon-button bordered" aria-label="More actions"><MoreHorizontal size={18} /></button></div>
       </div>
@@ -777,11 +796,11 @@ function PersonasTab({ report }: { report: RunReport }) {
   const [selected, setSelected] = useState(report.personas[0])
   const completedCount = report.personas.filter((persona) => persona.outcome !== 'failed').length
   const failedCount = report.personas.filter((persona) => persona.outcome === 'failed').length
-  return <div className="tab-content personas-tab"><section className="section-block"><div className="section-heading-row"><div><span className="card-kicker">{report.personasCount} SIMULATED USERS</span><h2>Different minds. One task.</h2><p>Each persona carries a distinct tolerance for ambiguity, risk, and exploration.</p></div><div className="persona-filter"><button className="active">All <span>{report.personasCount}</span></button><button>Completed <span>{completedCount}</span></button><button>Failed <span>{failedCount}</span></button></div></div><div className="persona-grid">{report.personas.map((persona) => <button className={'persona-card ' + (selected.id === persona.id ? 'selected' : '')} key={persona.id} onClick={() => setSelected(persona)}><div className="persona-card-top"><div className="persona-avatar large" style={{ background: persona.color }}>{persona.initials}</div><span className={'outcome-indicator ' + persona.outcome}><i />{persona.outcomeLabel}</span></div><h3>{persona.name}</h3><p>{persona.description}</p><div className="persona-card-stats"><span><strong>{persona.steps}</strong> steps</span><span><strong>{Math.round(persona.confidence * 100)}%</strong> confidence</span><span><strong>{persona.backtracks}</strong> backtracks</span></div></button>)}</div></section><PersonaDetail persona={selected} /></div>
+  return <div className="tab-content personas-tab"><section className="section-block"><div className="section-heading-row"><div><span className="card-kicker">{report.personasCount} SIMULATED USERS</span><h2>Different minds. One task.</h2><p>Each persona carries a distinct tolerance for ambiguity, risk, and exploration.</p></div><div className="persona-filter"><button className="active">All <span>{report.personasCount}</span></button><button>Completed <span>{completedCount}</span></button><button>Failed <span>{failedCount}</span></button></div></div><div className="persona-grid">{report.personas.map((persona) => <button className={'persona-card ' + (selected.id === persona.id ? 'selected' : '')} key={persona.id} onClick={() => setSelected(persona)}><div className="persona-card-top"><div className="persona-avatar large" style={{ background: persona.color }}>{persona.initials}</div><span className={'outcome-indicator ' + persona.outcome}><i />{persona.outcomeLabel}</span></div><h3>{persona.name}</h3><p>{persona.description}</p><div className="persona-profile-chips">{persona.behavior.labels.slice(0, 3).map((label) => <span key={label}>{label}</span>)}</div><div className="persona-card-stats"><span><strong>{persona.steps}</strong> steps</span><span><strong>{Math.round(persona.confidence * 100)}%</strong> confidence</span><span><strong>{persona.backtracks}</strong> backtracks</span></div></button>)}</div></section><PersonaDetail persona={selected} /></div>
 }
 
 function PersonaDetail({ persona }: { persona: PersonaResult }) {
-  return <section className="persona-detail panel"><div className="persona-detail-header"><div className="persona-avatar large" style={{ background: persona.color }}>{persona.initials}</div><div><span className="card-kicker">SELECTED PERSONA</span><h2>{persona.name}</h2><p>{persona.description}</p></div><span className={'outcome-indicator ' + persona.outcome}><i />{persona.outcomeLabel}</span></div><div className="persona-detail-grid"><div><span className="detail-label">Journey</span><div className="persona-path">{persona.path.map((path, index) => <span key={path}><b>{index + 1}</b>{path}{index < persona.path.length - 1 && <ArrowRight size={13} />}</span>)}</div></div><div><span className="detail-label">Primary signal</span><p className="persona-problem">{persona.primaryProblem}</p>{persona.confidenceDrop && <span className="confidence-drop"><TriangleAlert size={13} /> {persona.confidenceDrop}</span>}</div></div></section>
+  return <section className="persona-detail panel"><div className="persona-detail-header"><div className="persona-avatar large" style={{ background: persona.color }}>{persona.initials}</div><div><span className="card-kicker">SELECTED PERSONA</span><h2>{persona.name}</h2><p>{persona.description}</p><div className="persona-profile-chips detail-chips">{persona.behavior.labels.map((label) => <span key={label}>{label}</span>)}</div></div><span className={'outcome-indicator ' + persona.outcome}><i />{persona.outcomeLabel}</span></div><div className="persona-detail-grid"><div><span className="detail-label">Journey</span><div className="persona-path">{persona.path.map((path, index) => <span key={path}><b>{index + 1}</b>{path}{index < persona.path.length - 1 && <ArrowRight size={13} />}</span>)}</div></div><div><span className="detail-label">Behavior signal</span><p className="persona-problem">{persona.behavior.scanDepth} scan · {persona.behavior.recoveryStyle} recovery · {persona.behavior.device} profile</p><p className="persona-problem">{persona.behaviorStats.exploratoryActions} exploratory actions · {persona.behaviorStats.noProgressEvents} no-progress events · {persona.behaviorStats.uniquePages} unique pages</p>{persona.confidenceDrop && <span className="confidence-drop"><TriangleAlert size={13} /> {persona.confidenceDrop}</span>}</div></div></section>
 }
 
 export default App

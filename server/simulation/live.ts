@@ -1,9 +1,22 @@
 import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright'
-import { executeBrowserAction, observePage, validateBrowserAction } from './browser'
+import { executeBrowserAction, isProtectedBrowserAction, isSensitiveElement, observePage, validateBrowserAction } from './browser'
+import { isTaskProvidedValue } from './action-policy'
 import { personas as defaultPersonas } from './fixtures'
 import { decideWithJev, isJevAbortError, type JevAgentDecision } from './jev-agent'
+import {
+  createPersonaRandom,
+  createPersonaRuntimeSignals,
+  createRunSeed,
+  deriveStepBudget,
+  deviceLabel,
+  isComparisonSignal,
+  isExploratoryAction,
+  recoveryResponse,
+  sampleWaitMilliseconds,
+  type PersonaRuntimeSignals,
+} from './persona-policy'
 import type {
   AgentStep,
   BrowserAction,
@@ -13,9 +26,11 @@ import type {
   JourneyNode,
   Persona,
   PersonaResult,
+  ProtectedActionAudit,
   RunReport,
   ScreenshotFrame,
   LiveAgentState,
+  ActionPolicy,
 } from '../types'
 
 export interface LiveSimulationInput {
@@ -25,6 +40,8 @@ export interface LiveSimulationInput {
   personas: number
   maxSteps: number
   assetDir: string
+  actionPolicy: ActionPolicy
+  variationSeed?: number
   signal?: AbortSignal
   onProgress?: (progress: number, phase: string) => void
   onEvent?: (event: LiveEvent) => void
@@ -59,7 +76,7 @@ function stateFingerprint(state: Awaited<ReturnType<typeof observePage>>) {
 function actionLabel(action: BrowserAction) {
   if (action.type === 'click') return 'Clicked element ' + action.elementId
   if (action.type === 'type') return 'Typed into element ' + action.elementId
-  if (action.type === 'select') return 'Selected ' + action.value
+  if (action.type === 'select') return 'Selected an option in element ' + action.elementId
   if (action.type === 'scroll') return 'Scrolled ' + action.direction
   if (action.type === 'press_enter') return 'Pressed Enter'
   if (action.type === 'reload') return 'Reloaded the page'
@@ -80,12 +97,53 @@ function toneFor(action: BrowserAction, confidence: number): AgentStep['tone'] {
 function decisionLabel(decision: JevAgentDecision) {
   if (decision.action) return actionLabel(decision.action)
   if (decision.kind === 'protected') return 'Reached protected boundary'
+  if (decision.kind === 'abandon') return 'Abandoned route'
   return 'Jev selected ' + decision.actionName
 }
 
 function decisionTone(decision: JevAgentDecision): AgentStep['tone'] {
   if (decision.kind === 'finish' || decision.kind === 'protected') return 'success'
+  if (decision.kind === 'abandon') return 'danger'
   return toneFor(decision.action || { type: 'wait', milliseconds: 0 }, decision.confidence)
+}
+
+function actionNameFor(action: BrowserAction) {
+  if (action.type === 'scroll') return action.direction === 'down' ? 'scroll_down' : 'scroll_up'
+  return action.type
+}
+
+function forcedRecoveryDecision(action: BrowserAction, persona: Persona): JevAgentDecision {
+  return {
+    kind: 'action',
+    action,
+    actionName: actionNameFor(action),
+    confidence: 0.72,
+    goalComplete: 0,
+    destructive: 0,
+    summary: `${persona.name} ${action.type === 'back' ? 'backtracked' : 'recovered'} after a stalled interaction.`,
+    expectedOutcome: 'Revisit the previous route and reassess the task path.',
+    model: 'persona-policy',
+    latencyMs: 0,
+    inputTokens: 0,
+    costUsd: 0,
+  }
+}
+
+function abandonDecision(persona: Persona, reason: string): JevAgentDecision {
+  return {
+    kind: 'abandon',
+    actionName: 'none',
+    confidence: 0.2,
+    goalComplete: 0,
+    destructive: 0,
+    summary: `${persona.name} abandoned the route.`,
+    expectedOutcome: reason,
+    actualOutcome: reason,
+    model: 'persona-policy',
+    latencyMs: 0,
+    inputTokens: 0,
+    costUsd: 0,
+  }
 }
 
 function emitLiveEvent(input: LiveSimulationInput, event: Omit<LiveEvent, 'id' | 'at'>) {
@@ -127,8 +185,13 @@ async function capture(page: Page, directory: string, runId: string, personaId: 
 }
 
 async function simulatePersona(browser: Browser, input: LiveSimulationInput, persona: Persona, index: number, directory: string): Promise<PersonaRun> {
+  const random = createPersonaRandom(input.variationSeed || 1, persona.id)
+  const runtimeSignals: PersonaRuntimeSignals = createPersonaRuntimeSignals(persona, random)
+  const stepBudget = deriveStepBudget(input.maxSteps, persona, random)
   const context: BrowserContext = await browser.newContext({
-    viewport: { width: 1280, height: 820 },
+    viewport: persona.behavior.viewport,
+    isMobile: persona.behavior.device === 'mobile',
+    hasTouch: persona.behavior.device === 'mobile',
     serviceWorkers: 'block',
     colorScheme: index % 3 === 0 ? 'light' : 'dark',
   })
@@ -137,8 +200,12 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
   const timeline: AgentStep[] = []
   const screenshots: ScreenshotFrame[] = []
   const pathHistory: string[] = []
+  const visitedPages = new Set<string>()
   const history: { page: string; action: string; outcome: string }[] = []
   const avoidTargetIds = new Set<string>()
+  const protectedActionAudit: ProtectedActionAudit[] = []
+  let protectedActionsAttempted = 0
+  let pendingRecoveryAction: BrowserAction | undefined
   let currentState: Awaited<ReturnType<typeof observePage>>
   let outcome: PersonaResult['outcome'] = 'failed'
   let primaryProblem = 'The user reached the step limit without finding a confident path.'
@@ -149,6 +216,7 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
     await activePage.goto(input.website, { waitUntil: 'domcontentloaded', timeout: 15000 })
     currentState = await observePage(activePage)
     pathHistory.push(pageLabel(currentState))
+    visitedPages.add(currentState.url || pageLabel(currentState))
     const firstShot = await capture(activePage, directory, input.id, persona.id, 1, pageLabel(currentState), undefined, 'neutral', 'initial')
     if (firstShot) screenshots.push(firstShot)
     emitLiveEvent(input, {
@@ -164,49 +232,62 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
       screenshotSrc: firstShot?.src,
     })
 
-    for (let step = 1; step <= input.maxSteps; step += 1) {
+    for (let step = 1; step <= stepBudget; step += 1) {
       if (input.signal?.aborted) throw new Error('Run cancelled.')
       let decision: JevAgentDecision
-      try {
-        decision = await decideWithJev({
-          task: input.task,
-          persona,
-          state: currentState,
-          history,
-          avoidTargetIds: [...avoidTargetIds],
-          step,
-          maxSteps: input.maxSteps,
-          signal: input.signal,
-        })
-      } catch (error) {
-        if (input.signal?.aborted || isJevAbortError(error)) throw error
-        const message = error instanceof Error ? error.message : 'Jev could not decide the next action.'
-        primaryProblem = message
-        timeline.push({
-          step,
-          page: currentState.url,
-          pageLabel: pageLabel(currentState),
-          action: 'Jev decision failed',
-          actionDetail: 'The JEV request did not return a decision',
-          reasoningSummary: message,
-          confidence: 0,
-          expectedOutcome: 'Receive a typed JEV action for the current page.',
-          actualOutcome: message,
-          timeMs: 0,
-          tone: 'danger',
-        })
-        emitLiveEvent(input, {
-          kind: 'error',
-          personaId: persona.id,
-          personaName: persona.name,
-          step,
-          page: currentState.url,
-          pageLabel: pageLabel(currentState),
-          action: 'JEV decision failed',
-          detail: message,
-          confidence: 0,
-        })
-        break
+      if (pendingRecoveryAction) {
+        decision = forcedRecoveryDecision(pendingRecoveryAction, persona)
+        pendingRecoveryAction = undefined
+      } else {
+        try {
+          decision = await decideWithJev({
+            task: input.task,
+            persona,
+            state: currentState,
+            history,
+            avoidTargetIds: [...avoidTargetIds],
+            step,
+            maxSteps: stepBudget,
+            actionPolicy: input.actionPolicy,
+            runtimeSignals,
+            signal: input.signal,
+          })
+        } catch (error) {
+          if (input.signal?.aborted || isJevAbortError(error)) throw error
+          const message = error instanceof Error ? error.message : 'Jev could not decide the next action.'
+          primaryProblem = message
+          timeline.push({
+            step,
+            page: currentState.url,
+            pageLabel: pageLabel(currentState),
+            action: 'Jev decision failed',
+            actionDetail: 'The JEV request did not return a decision',
+            reasoningSummary: message,
+            confidence: 0,
+            expectedOutcome: 'Receive a typed JEV action for the current page.',
+            actualOutcome: message,
+            timeMs: 0,
+            tone: 'danger',
+          })
+          emitLiveEvent(input, {
+            kind: 'error',
+            personaId: persona.id,
+            personaName: persona.name,
+            step,
+            page: currentState.url,
+            pageLabel: pageLabel(currentState),
+            action: 'JEV decision failed',
+            detail: message,
+            confidence: 0,
+            deviceLabel: deviceLabel(persona.behavior),
+            profileLabels: persona.behavior.labels,
+          })
+          break
+        }
+      }
+
+      if (decision.action?.type === 'wait') {
+        decision.action = { ...decision.action, milliseconds: sampleWaitMilliseconds(persona.behavior, random) }
       }
 
       const actionTone = decisionTone(decision)
@@ -226,8 +307,41 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
       let actualOutcome = 'No action was executed.'
       let timeMs = 0
 
+      if (decision.kind === 'abandon') {
+        outcome = 'failed'
+        primaryProblem = decision.actualOutcome || decision.expectedOutcome
+        timeline.push({
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: 'Abandoned route',
+          actionDetail: decision.summary,
+          reasoningSummary: decision.summary,
+          confidence: decision.confidence,
+          expectedOutcome: decision.expectedOutcome,
+          actualOutcome: primaryProblem,
+          timeMs,
+          tone: 'danger',
+        })
+        emitLiveEvent(input, {
+          kind: 'error',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: currentState.url,
+          pageLabel: pageLabel(currentState),
+          action: 'Abandoned route',
+          detail: primaryProblem,
+          confidence: decision.confidence,
+          deviceLabel: deviceLabel(persona.behavior),
+          profileLabels: persona.behavior.labels,
+        })
+        break
+      }
+
       if (decision.kind === 'protected') {
         outcome = 'protected'
+        protectedActionsAttempted += 1
         primaryProblem = decision.actualOutcome || decision.summary
         timeline.push({
           step,
@@ -297,10 +411,18 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
 
       if (!decision.action) {
         const targetAction = decision.actionName === 'click' || decision.actionName === 'type' || decision.actionName === 'select'
-        if (targetAction && step < input.maxSteps) {
-          if (decision.targetId) avoidTargetIds.add(decision.targetId)
+        runtimeSignals.recoveryAttempts += 1
+        const recovery = recoveryResponse(persona, runtimeSignals, step, stepBudget, pathHistory.length > 1)
+        const shouldAbandon = recovery === 'abandon'
+        if (targetAction && !shouldAbandon) {
+          if (decision.targetId && recovery !== 'retry') avoidTargetIds.add(decision.targetId)
+          if (recovery === 'backtrack') pendingRecoveryAction = { type: 'back' }
           const retryOutcome = decision.targetId
-            ? 'Jev was unsure about this target, so the persona skipped it and asked JEV to reassess the other visible controls.'
+            ? recovery === 'backtrack'
+              ? 'Jev was unsure about this target, so the persona backtracked before reassessing the route.'
+              : recovery === 'retry'
+                ? 'Jev was unsure about this target, so the persona will retry once before moving on.'
+                : 'Jev was unsure about this target, so the persona reassessed the other visible controls.'
             : 'Jev chose a target action without a reliable target, so the persona asked JEV to reassess the page.'
           history.push({ page: pageLabel(currentState), action: decisionLabel(decision), outcome: retryOutcome })
           timeline.push({
@@ -318,7 +440,10 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
           })
           continue
         }
-        primaryProblem = decision.summary
+        primaryProblem = recovery === 'abandon'
+          ? `${persona.name} abandoned the route after an ambiguous next action.`
+          : decision.summary
+        outcome = 'failed'
         timeline.push({
           step,
           page: currentState.url,
@@ -335,7 +460,7 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
         break
       }
 
-      const validation = validateBrowserAction(decision.action, currentState)
+      const validation = validateBrowserAction(decision.action, currentState, { actionPolicy: input.actionPolicy })
       if (!validation.ok) {
         actualOutcome = validation.reason
         primaryProblem = validation.reason
@@ -377,9 +502,109 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
         ? currentState.interactiveElements.find((element) => element.id === selectedElementId)
         : undefined
       const selectedText = selectedElement?.text || selectedElement?.ariaLabel || selectedElement?.placeholder
+      const auditTarget = isSensitiveElement(selectedElement) ? 'Sensitive input' : selectedText
+      const protectedAction = input.actionPolicy === 'full'
+        && (decision.destructive >= 0.5 || isProtectedBrowserAction(decision.action, currentState))
+      if (isExploratoryAction(decision.action, selectedText, input.task)) {
+        if (runtimeSignals.exploratoryActions >= (runtimeSignals.explorationLimit ?? persona.behavior.explorationBudget)) {
+          decision = abandonDecision(persona, 'The persona exhausted its exploration budget before finding a task-relevant route.')
+          outcome = 'failed'
+          primaryProblem = decision.expectedOutcome
+          timeline.push({
+            step,
+            page: currentState.url,
+            pageLabel: pageLabel(currentState),
+            action: 'Exploration budget reached',
+            actionDetail: decision.summary,
+            reasoningSummary: decision.summary,
+            confidence: decision.confidence,
+            expectedOutcome: decision.expectedOutcome,
+            actualOutcome: primaryProblem,
+            timeMs,
+            tone: 'danger',
+          })
+          emitLiveEvent(input, {
+            kind: 'error',
+            personaId: persona.id,
+            personaName: persona.name,
+            step,
+            page: currentState.url,
+            pageLabel: pageLabel(currentState),
+            action: 'Exploration budget reached',
+            detail: primaryProblem,
+            confidence: decision.confidence,
+            deviceLabel: deviceLabel(persona.behavior),
+            profileLabels: persona.behavior.labels,
+          })
+          break
+        }
+        runtimeSignals.exploratoryActions += 1
+      }
+      if (isComparisonSignal(selectedText)) runtimeSignals.comparisonActions += 1
+      const sensitiveValue = decision.action.type === 'type' || decision.action.type === 'select' ? decision.action.value : undefined
+      if (input.actionPolicy === 'full' && sensitiveValue && isSensitiveElement(selectedElement) && !isTaskProvidedValue(sensitiveValue, input.task)) {
+        const reason = 'Sensitive values must be supplied verbatim by the task; the protected action was blocked.'
+        protectedActionsAttempted += 1
+        outcome = 'protected'
+        primaryProblem = reason
+        protectedActionAudit.push({
+          at: new Date().toISOString(),
+          personaId: persona.id,
+          personaName: persona.name,
+          page: beforeUrl,
+          pageLabel: beforeLabel,
+          action: decision.action.type,
+          target: auditTarget,
+          valueRedacted: true,
+          policy: input.actionPolicy,
+        })
+        timeline.push({
+          step,
+          page: beforeUrl,
+          pageLabel: beforeLabel,
+          action: 'Blocked protected value',
+          actionDetail: 'The task did not supply a verbatim sensitive value',
+          reasoningSummary: decisionReason,
+          confidence: decision.confidence,
+          expectedOutcome: 'Only task-provided sensitive values may be executed in full action mode.',
+          actualOutcome: reason,
+          timeMs,
+          tone: 'danger',
+        })
+        emitLiveEvent(input, {
+          kind: 'protected',
+          personaId: persona.id,
+          personaName: persona.name,
+          step,
+          page: beforeUrl,
+          pageLabel: beforeLabel,
+          action: 'Blocked protected value',
+          detail: reason,
+          confidence: decision.confidence,
+          latencyMs: decision.latencyMs,
+          deviceLabel: deviceLabel(persona.behavior),
+          profileLabels: persona.behavior.labels,
+          protectedAction: true,
+        })
+        break
+      }
+      if (protectedAction) {
+        protectedActionsAttempted += 1
+        protectedActionAudit.push({
+          at: new Date().toISOString(),
+          personaId: persona.id,
+          personaName: persona.name,
+          page: beforeUrl,
+          pageLabel: beforeLabel,
+          action: decision.action.type,
+          target: auditTarget,
+          valueRedacted: decision.action.type === 'type' || decision.action.type === 'select',
+          policy: input.actionPolicy,
+        })
+      }
       const actionStarted = Date.now()
       try {
-        actualOutcome = await executeBrowserAction(activePage, currentState, decision.action)
+        actualOutcome = await executeBrowserAction(activePage, currentState, decision.action, { actionPolicy: input.actionPolicy })
         timeMs = Date.now() - actionStarted
       } catch (error) {
         actualOutcome = error instanceof Error ? error.message : 'The browser action failed.'
@@ -413,6 +638,10 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
         break
       }
 
+      if (protectedAction) {
+        actualOutcome += ' Protected action executed under full action policy; sensitive values were redacted from the audit log.'
+      }
+
       if (decision.action.type === 'back') backtracks += 1
       await activePage.waitForTimeout(220).catch(() => undefined)
       const openPages = context.pages().filter((candidate) => !candidate.isClosed())
@@ -422,11 +651,25 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
       }
       currentState = await observePage(activePage)
       const currentLabel = pageLabel(currentState)
+      visitedPages.add(currentState.url || currentLabel)
       const pageChanged = currentState.url !== beforeUrl || stateFingerprint(currentState) !== beforeFingerprint
+      let shouldAbandonAfterAction = false
       if (pageChanged && currentState.url !== beforeUrl) avoidTargetIds.clear()
-      if (!pageChanged && selectedElementId && (decision.action.type === 'click' || decision.action.type === 'type' || decision.action.type === 'select')) {
-        avoidTargetIds.add(selectedElementId)
-        actualOutcome += ' The page state did not change, so JEV will avoid repeating this control.'
+      if (!pageChanged && decision.action.type !== 'wait') {
+        runtimeSignals.noProgressEvents += 1
+        runtimeSignals.recoveryAttempts += 1
+        const recovery = recoveryResponse(persona, runtimeSignals, step, stepBudget, pathHistory.length > 1)
+        if (selectedElementId && (decision.action.type === 'click' || decision.action.type === 'type' || decision.action.type === 'select')) {
+          if (persona.behavior.recoveryStyle !== 'retry' || runtimeSignals.recoveryAttempts > 1) avoidTargetIds.add(selectedElementId)
+          actualOutcome += persona.behavior.recoveryStyle === 'retry' && runtimeSignals.recoveryAttempts <= 1
+            ? ' The page state did not change, so this persona will retry once.'
+            : ' The page state did not change, so JEV will avoid repeating this control.'
+        }
+        if (recovery === 'backtrack' && decision.action.type !== 'back') {
+          pendingRecoveryAction = { type: 'back' }
+          actualOutcome += ' The persona will backtrack before reassessing the route.'
+        }
+        shouldAbandonAfterAction = recovery === 'abandon'
       }
       history.push({ page: beforeLabel, action: decisionLabel(decision), outcome: actualOutcome })
       if (currentLabel !== pathHistory[pathHistory.length - 1] || currentState.url !== beforeUrl || decision.action.type === 'back') pathHistory.push(currentLabel)
@@ -457,7 +700,15 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
         confidence: decision.confidence,
         latencyMs: decision.latencyMs,
         screenshotSrc: actionShot?.src,
+        deviceLabel: deviceLabel(persona.behavior),
+        profileLabels: persona.behavior.labels,
+        protectedAction,
       })
+      if (shouldAbandonAfterAction) {
+        outcome = 'failed'
+        primaryProblem = `${persona.name} abandoned the route after the page stopped making progress.`
+        break
+      }
     }
   } catch (error) {
     primaryProblem = error instanceof Error ? error.message : 'The browser session failed to load.'
@@ -481,6 +732,16 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
       duration: '0m ' + duration + 's',
       path: pathHistory,
       primaryProblem,
+      variationSeed: random.seed,
+      behaviorStats: {
+        exploratoryActions: runtimeSignals.exploratoryActions,
+        recoveryAttempts: runtimeSignals.recoveryAttempts,
+        noProgressEvents: runtimeSignals.noProgressEvents,
+        uniquePages: visitedPages.size,
+        comparisonActions: runtimeSignals.comparisonActions,
+        protectedActionsAttempted,
+      },
+      protectedActionAudit,
       confidenceDrop: timeline.length > 1 && timeline[timeline.length - 1].confidence < timeline[0].confidence - 0.2
         ? 'Step ' + timeline.length + ' · ' + Math.round(timeline[0].confidence * 100) + '% → ' + Math.round(timeline[timeline.length - 1].confidence * 100) + '%'
         : undefined,
@@ -621,6 +882,8 @@ function buildLiveAgentStates(results: PersonaResult[], liveEvents: LiveEvent[])
       confidence: lastEvent?.confidence ?? result.confidence,
       screenshotSrc: screenshotEvent?.screenshotSrc,
       lastEventAt: lastEvent?.at,
+      deviceLabel: deviceLabel(result.behavior),
+      profileLabels: result.behavior.labels,
     }
   })
 }
@@ -643,6 +906,8 @@ function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[], liveEve
     website: input.website,
     domain,
     task: input.task,
+    actionPolicy: input.actionPolicy,
+    variationSeed: input.variationSeed,
     createdAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
     personasCount: total,
@@ -671,13 +936,17 @@ function buildLiveReport(input: LiveSimulationInput, runs: PersonaRun[], liveEve
     screenshots,
     liveEvents,
     liveAgents: buildLiveAgentStates(results, liveEvents),
+    protectedActionAudit: runs.flatMap((run) => run.result.protectedActionAudit),
     bestPath: journey.bestPath,
-    guardrailNote: 'Live sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
+    guardrailNote: input.actionPolicy === 'full'
+      ? 'Full action mode was explicitly confirmed for this allowlisted test host. Protected actions were audit-logged and sensitive values were redacted from logs.'
+      : 'Live sessions stop before sensitive inputs, account creation, payment, messages, destructive actions, and protected submissions.',
   }
 }
 
 export async function runLiveSimulation(input: LiveSimulationInput): Promise<RunReport> {
   await mkdir(path.join(input.assetDir, input.id), { recursive: true })
+  const variationSeed = input.variationSeed || createRunSeed()
   const headless = process.env.GHOST_USER_HEADLESS !== '0'
   input.onProgress?.(8, headless ? 'Starting hidden browser sessions' : 'Opening visible Chrome session')
   const browser = await launchSimulationBrowser(headless)
@@ -686,6 +955,7 @@ export async function runLiveSimulation(input: LiveSimulationInput): Promise<Run
   const liveEvents: LiveEvent[] = []
   const sessionInput: LiveSimulationInput = {
     ...input,
+    variationSeed,
     onEvent: (event) => {
       liveEvents.push(event)
       input.onEvent?.(event)
@@ -703,7 +973,7 @@ export async function runLiveSimulation(input: LiveSimulationInput): Promise<Run
       input.onProgress?.(15 + Math.round(runs.length / selected.length * 72), 'Running live browser sessions · ' + runs.length + '/' + selected.length)
     }
     input.onProgress?.(93, 'Clustering live friction')
-    const report = buildLiveReport(input, runs, liveEvents)
+    const report = buildLiveReport(sessionInput, runs, liveEvents)
     if (!headless) {
       const closeDelayMs = Number(process.env.GHOST_USER_VISIBLE_CLOSE_DELAY_MS || 6000)
       await new Promise((resolve) => setTimeout(resolve, Math.max(1000, Math.min(closeDelayMs, 30000))))

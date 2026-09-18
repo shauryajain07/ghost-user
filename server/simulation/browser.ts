@@ -1,56 +1,71 @@
 import { chromium, type Page } from 'playwright'
-import type { BrowserAction, InteractiveElement, PageState } from '../types'
+import type { ActionPolicy, BrowserAction, InteractiveElement, PageState } from '../types'
+import { checkCurrentAction as pageCheckCurrentAction, readPageSnapshot as pageReadPageSnapshot } from './page-scripts.js'
 
-const interactiveSelector = 'a,button,input,select,textarea,[role="button"],[role="link"]'
-const sensitivePattern = /password|passcode|credit|card number|cvv|cvc|security code|ssn|social security/i
+const interactiveSelector = [
+  'a[href]',
+  'button',
+  'input',
+  'select',
+  'textarea',
+  'summary',
+  '[contenteditable="true"]',
+  '[role="button"]',
+  '[role="link"]',
+  '[role="checkbox"]',
+  '[role="radio"]',
+  '[role="switch"]',
+  '[role="tab"]',
+  '[role="menuitem"]',
+  '[role="menuitemradio"]',
+  '[role="option"]',
+  '[role="gridcell"]',
+  '[role="combobox"]',
+  '[role="textbox"]',
+  '[role="searchbox"]',
+  '[role="spinbutton"]',
+].join(',')
 
-const elementIdFor = (index: number) => 'el_' + String(index + 1).padStart(3, '0')
+export const sensitivePattern = /password|passcode|credit|card number|cvv|cvc|security code|ssn|social security/i
+export const protectedControlPattern = /sign\s*up|signup|register|create account|free trial|checkout|place order|buy now|purchase|pay|submit|send message|delete|book (?:a )?(?:demo|appointment)/i
+
+function elementSelector(elementId: string) {
+  return '[data-ghost-element="' + elementId + '"]'
+}
+
+function elementLabel(element: InteractiveElement) {
+  const selectContext = element.type === 'select'
+    ? [
+        element.value ? 'selected=' + element.value : '',
+        element.options?.length ? 'options=' + element.options.filter((option) => !option.disabled).map((option) => option.label).slice(0, 12).join('|') : '',
+      ]
+    : []
+  return [element.type, element.role, element.text, element.ariaLabel, element.placeholder, element.href, ...selectContext].filter(Boolean).join(' ')
+}
+
+export function isSensitiveElement(element: InteractiveElement | undefined) {
+  return Boolean(element && sensitivePattern.test(elementLabel(element)))
+}
+
+export function isProtectedControl(element: InteractiveElement | undefined) {
+  return Boolean(element && protectedControlPattern.test(elementLabel(element)))
+}
+
+export function isProtectedBrowserAction(action: BrowserAction, state: PageState) {
+  if (action.type !== 'click' && action.type !== 'type' && action.type !== 'select') return false
+  const element = state.interactiveElements.find((candidate) => candidate.id === action.elementId)
+  return action.type === 'click' ? isProtectedControl(element) : isSensitiveElement(element)
+}
 
 /**
  * Converts a live page into the compact state a persona policy is allowed to see.
- * The policy never receives a Playwright Page instance.
+ * The policy never receives a Playwright Page instance. The page-context script
+ * assigns stable ids to DOM nodes, captures accessible controls, and records
+ * per-target guards for the execution preflight below.
  */
 async function observePageOnce(page: Page): Promise<PageState> {
   await page.waitForLoadState('domcontentloaded', { timeout: 4000 }).catch(() => undefined)
-  const snapshot = await page.evaluate((selector) => {
-    const elements = Array.from(document.querySelectorAll(selector))
-    elements.forEach((element, index) => {
-      element.setAttribute('data-ghost-element', 'el_' + String(index + 1).padStart(3, '0'))
-    })
-
-    const interactiveElements = elements.flatMap((element, index) => {
-      const style = window.getComputedStyle(element)
-      const rect = element.getBoundingClientRect()
-      if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) return []
-      if (element.hasAttribute('disabled') || element.getAttribute('aria-disabled') === 'true') return []
-      const tag = element.tagName.toLowerCase()
-      const role = element.getAttribute('role')
-      const type = tag === 'a' || role === 'link'
-        ? 'link'
-        : tag === 'button' || role === 'button'
-          ? 'button'
-          : tag === 'input'
-            ? (element.getAttribute('type') === 'checkbox' ? 'checkbox' : element.getAttribute('type') === 'radio' ? 'radio' : 'input')
-            : tag === 'select'
-              ? 'select'
-              : 'other'
-      return [{
-        id: 'el_' + String(index + 1).padStart(3, '0'),
-        type,
-        text: (element.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 160) || undefined,
-        ariaLabel: element.getAttribute('aria-label') || undefined,
-        placeholder: element.getAttribute('placeholder') || undefined,
-        href: element.getAttribute('href') || undefined,
-      }]
-    })
-
-    return {
-      title: document.title,
-      visibleText: (document.body?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 8000),
-      interactiveElements,
-    }
-  }, interactiveSelector) as Omit<PageState, 'url'>
-
+  const snapshot = await page.evaluate(pageReadPageSnapshot, interactiveSelector) as Omit<PageState, 'url'>
   return { url: page.url(), ...snapshot }
 }
 
@@ -77,13 +92,20 @@ export async function observePage(page: Page): Promise<PageState> {
   return { url, title: '', visibleText: '', interactiveElements: [] }
 }
 
-export function validateBrowserAction(action: BrowserAction, state: PageState): { ok: true } | { ok: false; reason: string } {
+export function validateBrowserAction(action: BrowserAction, state: PageState, options: { actionPolicy?: ActionPolicy } = {}): { ok: true } | { ok: false; reason: string } {
+  const actionPolicy = options.actionPolicy || 'safe'
   if (action.type === 'click' || action.type === 'type' || action.type === 'select') {
     const element = state.interactiveElements.find((candidate) => candidate.id === action.elementId)
     if (!element) return { ok: false, reason: 'The selected element is no longer present on the page.' }
     if (action.type === 'type' && element.type !== 'input') return { ok: false, reason: 'Typing is only allowed in a visible input.' }
     if (action.type === 'select' && element.type !== 'select') return { ok: false, reason: 'Selecting an option requires a visible select.' }
-    if (action.type === 'type' && sensitivePattern.test([element.ariaLabel, element.placeholder, element.text].filter(Boolean).join(' '))) {
+    if (action.type === 'select' && element.options?.length && !element.options.some((option) => !option.disabled && (option.label === action.value || option.value === action.value))) {
+      return { ok: false, reason: 'The requested option is not available in the observed select.' }
+    }
+    if (actionPolicy === 'safe' && action.type === 'click' && isProtectedControl(element)) {
+      return { ok: false, reason: 'Reached protected action boundary: protected controls are never activated in safe mode.' }
+    }
+    if (actionPolicy === 'safe' && (action.type === 'type' || action.type === 'select') && isSensitiveElement(element)) {
       return { ok: false, reason: 'Reached protected action boundary: sensitive input is never populated.' }
     }
   }
@@ -99,25 +121,58 @@ export function validateBrowserAction(action: BrowserAction, state: PageState): 
   return { ok: true }
 }
 
+function targetIdFor(action: BrowserAction) {
+  return action.type === 'click' || action.type === 'type' || action.type === 'select' ? action.elementId : undefined
+}
+
+/**
+ * Re-checks the observed node immediately before execution. Model output never
+ * becomes a selector, and a stale or covered node is rejected instead of being
+ * clicked through with a JavaScript fallback.
+ */
+async function assertCurrentActionFresh(page: Page, state: PageState, action: BrowserAction) {
+  const targetId = targetIdFor(action)
+  if (!targetId) {
+    if (['scroll', 'back', 'forward', 'reload', 'press_enter'].includes(action.type) && state.url && page.url() !== state.url) {
+      throw new Error('The page changed since the decision was made. The persona must observe it again.')
+    }
+    return
+  }
+
+  const result = await page.evaluate(pageCheckCurrentAction, {
+    targetId,
+    expectedGuard: state.elementGuards?.[targetId] || '',
+  })
+
+  if (!result.ok) throw new Error(result.reason)
+}
+
 /**
  * Executes only a previously validated BrowserAction. This is the single
  * module allowed to translate an action into Playwright calls.
  */
-export async function executeBrowserAction(page: Page, state: PageState, action: BrowserAction): Promise<string> {
-  const validation = validateBrowserAction(action, state)
+export async function executeBrowserAction(page: Page, state: PageState, action: BrowserAction, options: { actionPolicy?: ActionPolicy } = {}): Promise<string> {
+  const validation = validateBrowserAction(action, state, options)
   if (!validation.ok) throw new Error(validation.reason)
+  await assertCurrentActionFresh(page, state, action)
+
   if (action.type === 'click') {
-    await page.locator('[data-ghost-element="' + action.elementId + '"]').first().click({ timeout: 5000, noWaitAfter: true })
-      .catch(async () => page.locator('[data-ghost-element="' + action.elementId + '"]').first().evaluate((element) => (element as HTMLElement).click()))
+    await page.locator(elementSelector(action.elementId)).first().click({ timeout: 5000, noWaitAfter: true })
     return 'Clicked the selected element.'
   }
   if (action.type === 'type') {
-    await page.locator('[data-ghost-element="' + action.elementId + '"]').first().fill(action.value.slice(0, 500))
-    return 'Entered the requested non-sensitive value.'
+    await page.locator(elementSelector(action.elementId)).first().fill(action.value.slice(0, 500))
+    return 'Entered the requested value.'
   }
   if (action.type === 'select') {
-    const locator = page.locator('[data-ghost-element="' + action.elementId + '"]').first()
-    await locator.selectOption({ label: action.value }).catch(async () => locator.selectOption(action.value))
+    const locator = page.locator(elementSelector(action.elementId)).first()
+    const optionValue = await locator.evaluate((element, requested) => {
+      if (!(element instanceof HTMLSelectElement)) return null
+      const option = Array.from(element.options).find((candidate) => !candidate.disabled && (candidate.label === requested || candidate.value === requested))
+      return option?.value ?? null
+    }, action.value)
+    if (optionValue === null) throw new Error('The requested option is no longer available in the observed select.')
+    await locator.selectOption(optionValue)
     return 'Selected the requested option.'
   }
   if (action.type === 'scroll') {

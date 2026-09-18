@@ -1,5 +1,9 @@
 export type RunStatus = 'queued' | 'running' | 'complete' | 'failed'
 export type ExecutionMode = 'live' | 'preview' | 'fallback'
+export type ActionPolicy = 'safe' | 'full'
+export type ScanDepth = 'shallow' | 'balanced' | 'deep'
+export type RecoveryStyle = 'retry' | 'backtrack' | 'abandon'
+export type DeviceProfile = 'desktop' | 'mobile'
 
 export type BrowserAction =
   | { type: 'click'; elementId: string }
@@ -15,13 +19,25 @@ export type BrowserAction =
   | { type: 'wait'; milliseconds: number }
   | { type: 'finish'; success: boolean; reason: string }
 
+export interface InteractiveOption {
+  label: string
+  value: string
+  disabled?: boolean
+}
+
 export interface InteractiveElement {
   id: string
   type: 'button' | 'link' | 'input' | 'select' | 'checkbox' | 'radio' | 'other'
+  role?: string
   text?: string
   ariaLabel?: string
   placeholder?: string
   href?: string
+  value?: string
+  checked?: boolean
+  selectedIndex?: number
+  expanded?: string
+  options?: InteractiveOption[]
 }
 
 export interface PageState {
@@ -29,6 +45,43 @@ export interface PageState {
   title: string
   visibleText: string
   interactiveElements: InteractiveElement[]
+  /** Internal execution guards; never sent to the model. */
+  snapshotKey?: string
+  elementGuards?: Record<string, string>
+}
+
+export interface PersonaBehaviorProfile {
+  scanDepth: ScanDepth
+  explorationBudget: number
+  comparisonBudget: number
+  noProgressLimit: number
+  recoveryStyle: RecoveryStyle
+  ctaBias: number
+  waitRangeMs: [number, number]
+  device: DeviceProfile
+  viewport: { width: number; height: number }
+  labels: string[]
+}
+
+export interface BehaviorStats {
+  exploratoryActions: number
+  recoveryAttempts: number
+  noProgressEvents: number
+  uniquePages: number
+  comparisonActions: number
+  protectedActionsAttempted: number
+}
+
+export interface ProtectedActionAudit {
+  at: string
+  personaId: string
+  personaName: string
+  page: string
+  pageLabel: string
+  action: string
+  target?: string
+  valueRedacted: boolean
+  policy: ActionPolicy
 }
 
 export interface Persona {
@@ -43,6 +96,7 @@ export interface Persona {
   attentionToDetail: number
   willingnessToExplore: number
   priceSensitivity: number
+  behavior: PersonaBehaviorProfile
 }
 
 export interface AgentStep {
@@ -69,6 +123,9 @@ export interface PersonaResult extends Persona {
   path: string[]
   primaryProblem: string
   confidenceDrop?: string
+  variationSeed: number
+  behaviorStats: BehaviorStats
+  protectedActionAudit: ProtectedActionAudit[]
   timeline: AgentStep[]
 }
 
@@ -125,6 +182,9 @@ export interface LiveEvent {
   confidence: number
   latencyMs?: number
   screenshotSrc?: string
+  deviceLabel?: string
+  profileLabels?: string[]
+  protectedAction?: boolean
 }
 
 export type LiveAgentStatus = 'queued' | 'running' | 'completed' | 'blocked' | 'failed'
@@ -141,6 +201,8 @@ export interface LiveAgentState {
   confidence: number
   screenshotSrc?: string
   lastEventAt?: string
+  deviceLabel?: string
+  profileLabels?: string[]
 }
 
 export interface RunMetrics {
@@ -166,6 +228,8 @@ export interface RunReport {
   website: string
   domain: string
   task: string
+  actionPolicy: ActionPolicy
+  variationSeed?: number
   createdAt: string
   completedAt?: string
   personasCount: number
@@ -180,6 +244,7 @@ export interface RunReport {
   screenshots: ScreenshotFrame[]
   liveEvents?: LiveEvent[]
   liveAgents?: LiveAgentState[]
+  protectedActionAudit?: ProtectedActionAudit[]
   bestPath: string[]
   guardrailNote: string
   errorMessage?: string
@@ -190,4 +255,6 @@ export interface CreateRunInput {
   task: string
   personas?: number
   maxSteps?: number
+  actionPolicy?: ActionPolicy
+  confirmProtectedActions?: boolean
 }
