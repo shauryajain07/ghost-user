@@ -134,9 +134,15 @@ export function isComparisonSignal(value: string | undefined) {
 }
 
 export function isExploratoryAction(action: BrowserAction, selectedLabel?: string, task?: string) {
-  if (action.type === 'scroll' || action.type === 'open_tab' || action.type === 'forward') return true
+  // Scrolling is required navigation when the agent is reading a long page;
+  // it should not spend the persona's limited budget for unrelated detours.
+  if (action.type === 'scroll') return false
+  if (action.type === 'open_tab' || action.type === 'forward') return true
   if (action.type !== 'click') return false
   const words = (task || '').toLowerCase().match(/[a-z0-9]+/g) || []
   const label = (selectedLabel || '').toLowerCase()
+  const taskIntent = /\b(open|start|begin|continue|next|practice|solve|answer|question|find|choose|select|launch|view)\b/i.test(task || '')
+  const directProgressControl = /\b(open|start|begin|continue|next|practice|solve|answer|question|launch|view)\b/i.test(label)
+  if (taskIntent && directProgressControl) return false
   return !words.some((word) => word.length > 2 && label.includes(word))
 }

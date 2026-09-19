@@ -65,7 +65,16 @@ export function isProtectedBrowserAction(action: BrowserAction, state: PageState
  */
 async function observePageOnce(page: Page): Promise<PageState> {
   await page.waitForLoadState('domcontentloaded', { timeout: 4000 }).catch(() => undefined)
-  const snapshot = await page.evaluate(pageReadPageSnapshot, interactiveSelector) as Omit<PageState, 'url'>
+  const readSnapshot = () => page.evaluate(pageReadPageSnapshot, interactiveSelector) as Promise<Omit<PageState, 'url'>>
+  let snapshot = await readSnapshot()
+  // Many modern pages update controls after the initial click returns. Wait
+  // for two matching snapshots so JEV does not decide on a half-rendered DOM.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.waitForTimeout(140).catch(() => undefined)
+    const settled = await readSnapshot()
+    if (settled.snapshotKey === snapshot.snapshotKey) return { url: page.url(), ...settled }
+    snapshot = settled
+  }
   return { url: page.url(), ...snapshot }
 }
 

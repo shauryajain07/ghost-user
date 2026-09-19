@@ -101,7 +101,8 @@ function clean(value: string | undefined) {
 
 function elementLabel(element: InteractiveElement) {
   const location = element.inViewport === false ? '[off-screen on loaded page]' : '[in current viewport]'
-  return [element.type, element.text || element.ariaLabel || element.placeholder || 'unnamed control', element.href ? `→ ${element.href}` : '', location]
+  const state = element.pressed === 'true' || element.selected === 'true' || element.checked === true ? '[already selected]' : ''
+  return [element.type, element.text || element.ariaLabel || element.placeholder || 'unnamed control', element.href ? `→ ${element.href}` : '', state, location]
     .filter(Boolean)
     .join(' ')
     .slice(0, 180)
@@ -133,7 +134,8 @@ function targetCandidates(state: PageState, task: string, avoided: Set<string>, 
       const priceBoost = persona && /price|pricing|plan|cost|billing|discount|free/i.test(label) ? persona.priceSensitivity * 4 : 0
       const technicalBoost = persona && /docs?|documentation|api|sdk|reference|auth|security/i.test(label) ? persona.technicalLiteracy * 4 : 0
       const ctaBoost = persona && /get started|start|try|learn more|explore/i.test(label) ? persona.behavior.ctaBias * 4 : 0
-      return { element, index, score: keywordScore + typeScore + priceBoost + technicalBoost + ctaBoost }
+      const selectedPenalty = element.pressed === 'true' || element.selected === 'true' || element.checked === true ? -8 : 0
+      return { element, index, score: keywordScore + typeScore + priceBoost + technicalBoost + ctaBoost + selectedPenalty }
     })
     .sort((left, right) => right.score - left.score || left.index - right.index)
     .slice(0, targetLimit)
@@ -217,7 +219,7 @@ function buildQuestions(
     action: choice(
       {
         question: 'Which single safe browser action should the persona take next to make progress on `goal`?',
-        focus: `Use the complete loaded-page text, all rendered element labels, page geometry, persona traits, behavior profile, recent_actions, runtime signals, and progress. ${behaviorSummary(persona)}. ${recoveryInstruction(persona, runtimeSignals)} Choose finish only when the requested outcome is present on the loaded page or the next action would cross a protected boundary. Never invent a target or value. Action policy is ${actionPolicy}; protected actions may only be executed when policy is full.`,
+        focus: `Use the complete loaded-page text, all rendered element labels, selected-state markers, page geometry, persona traits, behavior profile, recent_actions, runtime signals, and progress. Avoid clicking controls marked [already selected] unless the task explicitly requires changing that selection. ${behaviorSummary(persona)}. ${recoveryInstruction(persona, runtimeSignals)} Choose finish only when the requested outcome is present on the loaded page or the next action would cross a protected boundary. Never invent a target or value. Action policy is ${actionPolicy}; protected actions may only be executed when policy is full.`,
       },
       ACTION_CRITERIA,
     ),

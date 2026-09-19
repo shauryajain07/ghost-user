@@ -31,6 +31,7 @@ import type {
   ScreenshotFrame,
   LiveAgentState,
   ActionPolicy,
+  InteractiveElement,
 } from '../types'
 
 export interface LiveSimulationInput {
@@ -69,8 +70,81 @@ const pageLabel = (state: { url: string; title: string }) => {
 
 function stateFingerprint(state: Awaited<ReturnType<typeof observePage>>) {
   return state.url + '|' + state.title + '|' + state.scrollY + '|' + state.pageHeight + '|' + state.visibleText.slice(0, 2400) + '|' + state.interactiveElements
-    .map((element) => [element.id, element.type, element.text, element.ariaLabel, element.placeholder, element.href, element.inViewport, element.pageY].filter((value) => value !== undefined).join(':'))
+    .map((element) => [element.id, element.type, element.text, element.ariaLabel, element.placeholder, element.href, element.pressed, element.selected, element.checked, element.inViewport, element.pageY].filter((value) => value !== undefined).join(':'))
     .join('|')
+}
+
+function isRecoverableTargetError(value: string) {
+  return /observed control (?:changed|is no longer rendered|is no longer connected)|covered by another element|locator.*(timeout|detached)|element is not attached/i.test(value)
+}
+
+function interactiveLabel(element: InteractiveElement) {
+  return [element.text, element.ariaLabel, element.placeholder, element.href].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
+}
+
+function findTaskProgressTarget(state: Awaited<ReturnType<typeof observePage>>, task: string, avoided: Set<string>, excludedId?: string) {
+  if (!/\b(open|start|begin|continue|practice|solve|answer|question|launch|view)\b/i.test(task)) return undefined
+  const candidates = state.interactiveElements
+    .filter((element) => element.type === 'button' || element.type === 'link')
+    .filter((element) => !avoided.has(element.id) && element.id !== excludedId)
+    .map((element, index) => {
+      const label = interactiveLabel(element)
+      const actionWord = /\b(open|start|begin|continue|launch|next|practice|solve|answer|view)\b/i.test(label)
+      const destinationWord = /\b(vault|practice|question|quiz|set|session)\b/i.test(label)
+      if (!actionWord || !destinationWord) return { element, index, score: -1 }
+      let score = 10
+      if (/\bstart\s+practice\b/i.test(label)) score += 100
+      if (/\bopen(?:\s+the)?\s+vault\b/i.test(label)) score += 95
+      if (/\bnext\s+question\b/i.test(label)) score += 80
+      if (/\bcontinue\b/i.test(label)) score += 70
+      if (element.type === 'button') score += 4
+      if (element.inViewport === false) score -= 1
+      return { element, index, score }
+    })
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+  return candidates[0]?.score > 0 ? candidates[0].element : undefined
+}
+
+function fallbackProgressDecision(persona: Persona, target: InteractiveElement, reason: string): JevAgentDecision {
+  return {
+    kind: 'action',
+    action: { type: 'click', elementId: target.id },
+    actionName: 'click',
+    targetId: target.id,
+    confidence: 0.78,
+    goalComplete: 0,
+    destructive: 0,
+    summary: `${persona.name} used the clearest task-progress control after JEV could not identify a reliable next action: ${interactiveLabel(target)}.`,
+    expectedOutcome: reason,
+    model: 'persona-policy-recovery',
+    latencyMs: 0,
+    inputTokens: 0,
+    costUsd: 0,
+  }
+}
+
+function isPracticeBoundary(state: Awaited<ReturnType<typeof observePage>>, task: string) {
+  const page = pageLabel(state)
+  const pageText = [page, state.url, state.title, state.visibleText].join(' ')
+  return /\b(open|start|begin|practice|solve|answer|question)\b/i.test(task)
+    && /practice|question/i.test(pageText)
+    && /select an answer|next question|reveal|answer/i.test(pageText)
+}
+
+function fallbackFinishDecision(persona: Persona): JevAgentDecision {
+  return {
+    kind: 'finish',
+    actionName: 'finish',
+    confidence: 0.82,
+    goalComplete: 0.82,
+    destructive: 0,
+    summary: `${persona.name} reached the loaded practice question boundary; no further scrolling is needed to satisfy the navigation task.`,
+    expectedOutcome: 'Record the practice question page as the task boundary.',
+    model: 'persona-policy-recovery',
+    latencyMs: 0,
+    inputTokens: 0,
+    costUsd: 0,
+  }
 }
 
 function actionLabel(action: BrowserAction) {
@@ -170,7 +244,7 @@ async function capture(page: Page, directory: string, runId: string, personaId: 
   const fileName = personaId + '-' + String(step).padStart(2, '0') + '-' + variant + '.png'
   const filePath = path.join(directory, fileName)
   try {
-    await page.screenshot({ path: filePath, fullPage: false })
+    await page.screenshot({ path: filePath, fullPage: true })
     return {
       step,
       page: label,
@@ -206,6 +280,7 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
   const protectedActionAudit: ProtectedActionAudit[] = []
   let protectedActionsAttempted = 0
   let pendingRecoveryAction: BrowserAction | undefined
+  let staleTargetRecoveries = 0
   let currentState: Awaited<ReturnType<typeof observePage>>
   let outcome: PersonaResult['outcome'] = 'failed'
   let primaryProblem = 'The user reached the step limit without finding a confident path.'
@@ -288,6 +363,21 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
 
       if (decision.action?.type === 'wait') {
         decision.action = { ...decision.action, milliseconds: sampleWaitMilliseconds(persona.behavior, random) }
+      }
+
+      // Keep JEV first, but do not let a low-confidence/empty answer strand a
+      // persona when the loaded page exposes one unmistakable forward control.
+      // This is intentionally narrow: it only applies to task-progress labels
+      // such as "Open the Vault" or "Start Practice" and never invents a
+      // selector or value.
+      if (isPracticeBoundary(currentState, input.task)
+        && (!decision.action || ['scroll', 'wait'].includes(decision.action.type))) {
+        decision = fallbackFinishDecision(persona)
+      } else if (decision.kind === 'wait' && !decision.action) {
+        const fallbackTarget = findTaskProgressTarget(currentState, input.task, avoidTargetIds, decision.targetId)
+        if (fallbackTarget) {
+          decision = fallbackProgressDecision(persona, fallbackTarget, 'The next task boundary should become visible after this control.')
+        }
       }
 
       const actionTone = decisionTone(decision)
@@ -609,6 +699,43 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
       } catch (error) {
         actualOutcome = error instanceof Error ? error.message : 'The browser action failed.'
         timeMs = Date.now() - actionStarted
+        if (selectedElementId && isRecoverableTargetError(actualOutcome) && staleTargetRecoveries < 2) {
+          staleTargetRecoveries += 1
+          avoidTargetIds.add(selectedElementId)
+          const recoveryOutcome = 'The browser rejected a stale target, so the persona re-observed the settled page and will choose another action.'
+          await activePage.waitForTimeout(260).catch(() => undefined)
+          currentState = await observePage(activePage)
+          const recoveredLabel = pageLabel(currentState)
+          history.push({ page: recoveredLabel, action: 'Re-observed after stale target', outcome: recoveryOutcome })
+          timeline.push({
+            step,
+            page: currentState.url,
+            pageLabel: recoveredLabel,
+            action: 'Recovered from stale target',
+            actionDetail: actualOutcome,
+            reasoningSummary: decisionReason,
+            confidence: decision.confidence,
+            expectedOutcome: 'Reassess the settled page without repeating the rejected target.',
+            actualOutcome: recoveryOutcome,
+            timeMs,
+            tone: 'warning',
+          })
+          emitLiveEvent(input, {
+            kind: 'action',
+            personaId: persona.id,
+            personaName: persona.name,
+            step,
+            page: currentState.url,
+            pageLabel: recoveredLabel,
+            action: 'Re-observed after stale target',
+            detail: actualOutcome + ' ' + recoveryOutcome,
+            confidence: decision.confidence,
+            latencyMs: decision.latencyMs,
+            deviceLabel: deviceLabel(persona.behavior),
+            profileLabels: persona.behavior.labels,
+          })
+          continue
+        }
         primaryProblem = actualOutcome
         timeline.push({
           step,
@@ -643,7 +770,9 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
       }
 
       if (decision.action.type === 'back') backtracks += 1
-      await activePage.waitForTimeout(220).catch(() => undefined)
+      // Give client-side selection controls time to finish their async
+      // rerender before taking the next decision snapshot.
+      await activePage.waitForTimeout(520).catch(() => undefined)
       const openPages = context.pages().filter((candidate) => !candidate.isClosed())
       if (activePage.isClosed() || decision.action.type === 'open_tab' || decision.action.type === 'close_tab') {
         activePage = openPages[openPages.length - 1] || await context.newPage()
@@ -665,11 +794,18 @@ async function simulatePersona(browser: Browser, input: LiveSimulationInput, per
             ? ' The page state did not change, so this persona will retry once.'
             : ' The page state did not change, so JEV will avoid repeating this control.'
         }
-        if (recovery === 'backtrack' && decision.action.type !== 'back') {
+        const fallbackTarget = findTaskProgressTarget(currentState, input.task, avoidTargetIds, selectedElementId)
+        if (fallbackTarget && decision.action.type !== 'back') {
+          pendingRecoveryAction = { type: 'click', elementId: fallbackTarget.id }
+          actualOutcome += ' The page did not change, so the persona will try the clearest task-progress control.'
+          shouldAbandonAfterAction = false
+        } else if (recovery === 'backtrack' && decision.action.type !== 'back') {
           pendingRecoveryAction = { type: 'back' }
           actualOutcome += ' The persona will backtrack before reassessing the route.'
+          shouldAbandonAfterAction = false
+        } else {
+          shouldAbandonAfterAction = recovery === 'abandon'
         }
-        shouldAbandonAfterAction = recovery === 'abandon'
       }
       history.push({ page: beforeLabel, action: decisionLabel(decision), outcome: actualOutcome })
       if (currentLabel !== pathHistory[pathHistory.length - 1] || currentState.url !== beforeUrl || decision.action.type === 'back') pathHistory.push(currentLabel)

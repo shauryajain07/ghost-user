@@ -131,6 +131,7 @@ export function readPageSnapshot(selector) {
       disabled: element.matches(':disabled') || element.getAttribute('aria-disabled') === 'true',
       readOnly: 'readOnly' in element ? Boolean(element.readOnly) : element.getAttribute('aria-readonly') === 'true',
       expanded: element.getAttribute('aria-expanded'),
+      pressed: element.getAttribute('aria-pressed'),
       selected: element.getAttribute('aria-selected'),
       href: element.getAttribute('href'),
       context: normalize(scope?.textContent).slice(0, 1200),
@@ -166,6 +167,8 @@ export function readPageSnapshot(selector) {
       checked,
       selectedIndex: element instanceof HTMLSelectElement ? element.selectedIndex : undefined,
       expanded: element.getAttribute('aria-expanded') || undefined,
+      pressed: element.getAttribute('aria-pressed') || undefined,
+      selected: element.getAttribute('aria-selected') || undefined,
       inViewport: layout.inViewport,
       pageX: layout.pageX,
       pageY: layout.pageY,
@@ -187,7 +190,7 @@ export function readPageSnapshot(selector) {
     innerWidth: window.innerWidth,
     innerHeight: window.innerHeight,
     pageHeight,
-    elements: publicElements.map((element) => [element.id, element.role, element.text, element.ariaLabel, element.value, element.href]),
+    elements: publicElements.map((element) => [element.id, element.role, element.text, element.ariaLabel, element.value, element.href, element.pressed, element.selected, element.checked]),
   })
 
   return {
@@ -261,6 +264,7 @@ export function checkCurrentAction({ targetId, expectedGuard }) {
       disabled: candidate.matches(':disabled') || candidate.getAttribute('aria-disabled') === 'true',
       readOnly: 'readOnly' in candidate ? Boolean(candidate.readOnly) : candidate.getAttribute('aria-readonly') === 'true',
       expanded: candidate.getAttribute('aria-expanded'),
+      pressed: candidate.getAttribute('aria-pressed'),
       selected: candidate.getAttribute('aria-selected'),
       href: candidate.getAttribute('href'),
       context: normalize(scope?.textContent).slice(0, 1200),

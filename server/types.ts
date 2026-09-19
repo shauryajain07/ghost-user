@@ -37,6 +37,8 @@ export interface InteractiveElement {
   checked?: boolean
   selectedIndex?: number
   expanded?: string
+  pressed?: string
+  selected?: string
   inViewport?: boolean
   pageX?: number
   pageY?: number

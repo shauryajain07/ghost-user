@@ -109,7 +109,7 @@ Each persona also has a `PersonaBehaviorProfile`:
 
 | Field | Meaning |
 | --- | --- |
-| `scanDepth` | `shallow`, `balanced`, or `deep`; controls how much visible page text is supplied to JEV (2,200 / 4,200 / 6,000 characters) |
+| `scanDepth` | `shallow`, `balanced`, or `deep`; controls how many controls are ranked and how long the persona explores. JEV receives up to 24,000 characters of readable text from the loaded page, including below-the-fold content |
 | `explorationBudget` | How many off-task or context-building actions the user may take |
 | `comparisonBudget` | How much plan, feature, pricing, or proof-point comparison the user will tolerate |
 | `noProgressLimit` | How many unchanged page states are accepted before recovery or abandonment |
